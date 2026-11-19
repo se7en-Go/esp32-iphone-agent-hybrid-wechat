@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esp32-iphone-agent-hybrid-wechat"
+version = "0.1.0"
+description = "Independent WeChat business automation CLI & skills built on top of esp32-iphone-agent-hybrid-new"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "Pillow>=10.0",
+    "PyYAML>=6.0",
+    "rapidocr-onnxruntime>=1.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+wechat-agent = "wechat_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

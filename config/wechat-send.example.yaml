@@ -1,0 +1,33 @@
+# M1 通用微信发消息配置模板（复制为 config/wechat-send.local.yaml 后按需调整）
+# 注意：config/*.local.yaml 已被 .gitignore 忽略
+
+# 底座 CLI 可执行文件路径（也可通过环境变量 IPHONE_AGENT_CLI 覆盖）
+iphone_agent_cli: "/Users/seven/Documents/esp32-iphone-agent-hybrid-new/server/.venv/bin/iphone-agent"
+
+# 底座服务地址（也可通过环境变量 IPHONE_AGENT_URL 覆盖）
+iphone_agent_url: "http://127.0.0.1:8890"
+
+# 挂载到 HIDAGENT_SKILLS 中的 Skill 名称
+skill_name: "wechat-send"
+
+# M1 目标会话白名单：初期严格仅允许「文件传输助手」
+allowed_targets:
+  - "文件传输助手"
+
+# 本仓独立 OCR 引擎：rapidocr（默认）；预留 apple-vision 协议扩展口
+ocr_backend: "rapidocr"
+
+# 私有证据目录（自动强制 0700 目录权限与 0600 文件权限，禁止写 /tmp）
+evidence_root: ".local-data/runs"
+
+# CLI 单次调用超时秒数
+cli_timeout_seconds: 90.0
+
+# paste-flow 多阶段粘贴超时秒数（需容纳允许粘贴弹窗与 confirm 重试）
+paste_flow_timeout_seconds: 180.0
+
+# 常规点击链测量落点偏位时，带 --rehome 的最大重定位次数
+point_rehome_retries: 1
+
+# 发送前移针（仅 point，不含 click）遇光标闪烁 409 时的最大重试次数
+pre_send_point_retries: 3

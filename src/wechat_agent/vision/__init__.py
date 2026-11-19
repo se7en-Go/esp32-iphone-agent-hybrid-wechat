@@ -1,0 +1,56 @@
+"""Independent vision, OCR, and dynamic WeChat UI geometry layer."""
+
+from .geometry import (
+    HOME_INDICATOR_MAX_SAFE_Y,
+    HOME_INDICATOR_X_RANGE,
+    HOME_INDICATOR_Y,
+    clamp_avoiding_home_indicator,
+    derive_home_icon_body_box,
+    is_in_home_indicator_zone,
+    left_biased_input_aim,
+    normalize_text,
+)
+from .ocr import AppleVisionOcrEngine, OcrEngine, RapidOcrEngine, create_ocr_engine
+from .wechat_ui import (
+    FocusedInputLayout,
+    ScreenKind,
+    detect_existing_draft,
+    detect_keyboard_and_focused_input,
+    detect_screen_context,
+    extract_outgoing_bubbles,
+    find_chat_row_box,
+    find_home_wechat_icon,
+    find_spotlight_wechat_target,
+    has_new_outgoing_bubble,
+    locate_blue_send_button,
+    locate_collapsed_input_box,
+    verify_pasted_text,
+)
+
+__all__ = [
+    "AppleVisionOcrEngine",
+    "FocusedInputLayout",
+    "HOME_INDICATOR_MAX_SAFE_Y",
+    "HOME_INDICATOR_X_RANGE",
+    "HOME_INDICATOR_Y",
+    "OcrEngine",
+    "RapidOcrEngine",
+    "ScreenKind",
+    "clamp_avoiding_home_indicator",
+    "create_ocr_engine",
+    "derive_home_icon_body_box",
+    "detect_existing_draft",
+    "detect_keyboard_and_focused_input",
+    "detect_screen_context",
+    "extract_outgoing_bubbles",
+    "find_chat_row_box",
+    "find_home_wechat_icon",
+    "find_spotlight_wechat_target",
+    "has_new_outgoing_bubble",
+    "is_in_home_indicator_zone",
+    "left_biased_input_aim",
+    "locate_blue_send_button",
+    "locate_collapsed_input_box",
+    "normalize_text",
+    "verify_pasted_text",
+]
