@@ -77,23 +77,100 @@ def _has_bottom_wechat_tabs(ocr_boxes: list[OcrBox]) -> bool:
     return len(bottom_tokens) >= 2
 
 
-def has_exact_chat_title(ocr_boxes: list[OcrBox], target_title: str) -> bool:
+def extract_header_title(ocr_boxes: list[OcrBox]) -> str | None:
+    """Return the normalized top navigation header title if present."""
+    candidates = [
+        b
+        for b in ocr_boxes
+        if 0.045 <= b.box.top and b.box.bottom <= 0.14 and 0.14 <= b.box.center[0] <= 0.86
+    ]
+    if not candidates:
+        candidates = [
+            b
+            for b in ocr_boxes
+            if 0.03 <= b.box.top and b.box.bottom <= 0.14 and 0.18 <= b.box.center[0] <= 0.82
+        ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda b: abs(b.box.center[0] - 0.5))
+    title = normalize_text(candidates[0].text)
+    return title or None
+
+
+def has_exact_chat_title(
+    ocr_boxes: list[OcrBox],
+    target_title: str,
+    *,
+    allow_group_count: bool = False,
+) -> bool:
     """Return True if the top navigation header uniquely shows `target_title`."""
     target_norm = normalize_text(target_title)
     if not target_norm:
         return False
+    group_pattern = (
+        re.compile(re.escape(target_norm) + r"\s*\(\d+\)")
+        if allow_group_count
+        else None
+    )
     for item in ocr_boxes:
         if item.box.top < 0.03 or item.box.bottom > 0.14:
             continue
         cx = item.box.center[0]
         if not (0.14 <= cx <= 0.86):
             continue
-        if normalize_text(item.text) == target_norm:
+        item_norm = normalize_text(item.text)
+        if item_norm == target_norm:
+            return True
+        if group_pattern is not None and group_pattern.fullmatch(item_norm):
             return True
     return False
 
 
-def detect_screen_context(ocr_boxes: list[OcrBox], target_title: str) -> ScreenKind:
+_LOCK_SCREEN_PHRASES = (
+    "向上轻扫以解锁",
+    "向上轻扫以打开",
+    "向上轻扫以开启",
+    "Swipe up to unlock",
+    "Swipe up to open",
+    "输入密码",
+    "Enter Passcode",
+    "Touch ID",
+    "触控 ID",
+    "面容 ID",
+    "Face ID",
+)
+
+
+def is_lock_screen(ocr_boxes: list[OcrBox], image_bytes: bytes = b"") -> bool:
+    """Return True if the screen appears asleep/black or displays the iOS Lock Screen."""
+    rgb = _decode_rgb(image_bytes)
+    if rgb is not None and float(rgb.mean()) < 12.0:
+        return True
+
+    for item in ocr_boxes:
+        norm = normalize_text(item.text)
+        if any(phrase in norm for phrase in _LOCK_SCREEN_PHRASES):
+            return True
+
+    # Large centered lock-screen clock HH:MM in upper-middle band without WeChat header
+    for item in ocr_boxes:
+        norm = normalize_text(item.text)
+        if (
+            0.08 <= item.box.top <= 0.30
+            and 0.25 <= item.box.center[0] <= 0.75
+            and item.box.height >= 0.045
+            and re.fullmatch(r"\d{1,2}:\d{2}", norm)
+        ):
+            return True
+    return False
+
+
+def detect_screen_context(
+    ocr_boxes: list[OcrBox],
+    target_title: str,
+    *,
+    allow_group_count: bool = False,
+) -> ScreenKind:
     """Classify the current iOS / WeChat screen based on OCR detections."""
     if _has_bottom_wechat_tabs(ocr_boxes):
         return ScreenKind.WECHAT_CHAT_LIST
@@ -104,7 +181,7 @@ def detect_screen_context(ocr_boxes: list[OcrBox], target_title: str) -> ScreenK
     if has_cancel and (has_wechat_query or any(normalize_text(b.text) in {"微信", "WeChat"} for b in ocr_boxes)):
         return ScreenKind.SPOTLIGHT_RESULTS
 
-    if has_exact_chat_title(ocr_boxes, target_title):
+    if has_exact_chat_title(ocr_boxes, target_title, allow_group_count=allow_group_count):
         return ScreenKind.TARGET_CHAT
 
     # If a WeChat icon/label appears on screen without WeChat tabs or chat nav bar, assume Home Screen.

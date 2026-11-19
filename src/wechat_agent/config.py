@@ -31,6 +31,7 @@ class WeChatSendConfig:
     point_rehome_retries: int = 1
     pre_send_point_retries: int = 3
     require_mounted_skill: bool = True
+    allow_group_count: bool = False
 
     def resolved_evidence_root(self) -> Path:
         if self.evidence_root.is_absolute():
@@ -85,6 +86,7 @@ def load_config(
     point_rehome_retries = max(0, int(data.get("point_rehome_retries", 1)))
     pre_send_point_retries = max(1, int(data.get("pre_send_point_retries", 3)))
     require_mounted_skill = bool(data.get("require_mounted_skill", True))
+    allow_group_count = bool(data.get("allow_group_count", False))
 
     if allowed_targets_override is not None:
         raw_targets = list(allowed_targets_override)
@@ -107,4 +109,5 @@ def load_config(
         point_rehome_retries=point_rehome_retries,
         pre_send_point_retries=pre_send_point_retries,
         require_mounted_skill=require_mounted_skill,
+        allow_group_count=allow_group_count,
     )

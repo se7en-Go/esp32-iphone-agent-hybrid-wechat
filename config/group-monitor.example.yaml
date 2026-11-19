@@ -1,0 +1,77 @@
+# M2 指定微信群监控与两级混合自动回复配置模板（复制为 config/group-monitor.local.yaml 后按需配置）
+# 注意：config/*.local.yaml 已被 .gitignore 忽略
+
+# 底座 CLI 与地址
+iphone_agent_cli: "/Users/seven/Documents/esp32-iphone-agent-hybrid-new/server/.venv/bin/iphone-agent"
+iphone_agent_url: "http://127.0.0.1:8890"
+skill_name: "wechat-group-reply"
+ocr_backend: "rapidocr"
+
+# 运行模式：默认 observe-only（只观察提取、决策并写入审计日志，零点击零输入）
+# 注意：对任何真实微信群，observe-only 与 dry-run 均为只读模式，绝不聚焦输入框或粘贴草稿
+mode: "observe-only"
+allow_live_send: false
+
+# Q1=A：首版聚焦单群驻留监控，配置层保留多群列表结构（首版取第一项作为活跃监控群）
+# 初期请保持为空，待有明确测试群后再填入群名称（自动兼容微信标题尾部人数如「测试群(12)」）
+target_groups: []
+#  - name: "示例测试群"
+#    gate: "hybrid"                    # rule | llm | hybrid | jev | observe_only
+#    min_confidence: 0.70
+#    max_risk_score: 0.30
+#    mention_min_confidence: 0.50
+#    mention_must_reply: false
+#    per_group_cooldown_seconds: 60.0
+#    per_group_max_per_hour: 6
+#    self_aliases: ["运营助手"]
+#    role_prompt: "仅负责门店营业时间与活动咨询答疑；遇到退款售后或群友闲聊保持静默。"
+#    allow_dry_run_paste: false        # 仅在明确授权的模拟会话（如文件传输助手）且为 true 时才允许 dry-run 粘贴
+
+# 本号在群内的默认昵称（用于 @本号 识别）
+self_aliases:
+  - "运营助手"
+
+# 可选：全局默认群业务职责与静默边界提示（支持在 target_groups 单群条目中覆盖；将注入 LLM 决策与回复提示词）
+role_prompt: ""
+
+# 仅允许用于真机 dry-run 粘贴模拟的测试会话列表
+simulation_targets:
+  - "文件传输助手"
+
+# 第一层决策器（DecisionGate）与阈值
+default_gate: "hybrid"                 # observe_only | rule | llm | hybrid | jev（jev 为预留扩展槽位）
+rules_path: "config/rules.example.yaml"
+min_confidence: 0.70
+max_risk_score: 0.30
+mention_min_confidence: 0.50
+mention_must_reply: false
+context_window: 8
+
+# Q4=A：轮询频率与双层频控默认值（只严不宽于底座与 wechat-group-reply/SKILL.md）
+poll_interval_min_seconds: 8.0
+poll_interval_max_seconds: 12.0
+quiet_hours: "23:00-07:00"
+rate_limits:
+  global_min_interval_seconds: 15.0    # 底座下限 3s，本配置更严
+  global_max_per_hour: 15              # 底座上限 30 次，本配置更严
+  per_group_cooldown_seconds: 60.0
+  per_group_max_per_hour: 6
+  human_takeover_cooldown_seconds: 600.0  # 检测到真人手动回复后静默 10 分钟
+  max_reply_chars: 240
+
+# OpenAI 兼容 LLM 客户端（适配 DeepSeek 等；默认关闭，建议通过环境变量 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL 注入）
+llm:
+  enabled: false
+  base_url: ""
+  api_key: ""
+  model: ""
+  timeout_seconds: 20.0
+  temperature: 0.2
+  max_tokens: 256
+
+# 私有状态库与审计日志（0700 目录 / 0600 文件）
+state_db_path: ".local-data/state/wechat_monitor.db"
+audit_log_path: ".local-data/state/monitor_audit.jsonl"
+evidence_root: ".local-data/runs"
+cli_timeout_seconds: 90.0
+paste_flow_timeout_seconds: 180.0

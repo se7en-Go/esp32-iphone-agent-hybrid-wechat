@@ -31,11 +31,14 @@ class WeChatNavigator:
         ocr: OcrEngine,
         click_chain: ClickChain,
         evidence: RunEvidence,
+        *,
+        allow_group_count: bool = False,
     ) -> None:
         self.driver = driver
         self.ocr = ocr
         self.click_chain = click_chain
         self.evidence = evidence
+        self.allow_group_count = allow_group_count
 
     def _next_observation(self, click_res: ClickResult, step_name: str) -> Observation:
         if click_res.screen_id and click_res.image_bytes:
@@ -61,10 +64,18 @@ class WeChatNavigator:
         max_conflict_retries = 3
 
         for step in range(9):
-            kind = detect_screen_context(ocr_boxes, target_title)
+            kind = detect_screen_context(
+                ocr_boxes,
+                target_title,
+                allow_group_count=self.allow_group_count,
+            )
             self.evidence.log_event("nav_screen_context", {"step": step, "kind": kind.value})
 
-            if kind == ScreenKind.TARGET_CHAT and has_exact_chat_title(ocr_boxes, target_title):
+            if kind == ScreenKind.TARGET_CHAT and has_exact_chat_title(
+                ocr_boxes,
+                target_title,
+                allow_group_count=self.allow_group_count,
+            ):
                 return obs, ocr_boxes
 
             try:

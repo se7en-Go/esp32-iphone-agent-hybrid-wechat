@@ -11,6 +11,12 @@ from wechat_agent.adapters.driver import DriverError
 from wechat_agent.adapters.iphone_cli import IphoneAgentCliDriver
 from wechat_agent.config import WeChatSendConfig, load_config
 from wechat_agent.guards.skill_guard import validate_skills_dir
+from wechat_agent.monitor.config import load_monitor_config
+from wechat_agent.monitor.decision import build_decision_gate, load_rules_yaml
+from wechat_agent.monitor.generators import HybridReplyGenerator, LlmReplyGenerator, RuleTemplateGenerator
+from wechat_agent.monitor.llm_client import OpenAICompatibleLlmClient
+from wechat_agent.monitor.runner import MonitorRunner
+from wechat_agent.monitor.store import MonitorStore
 from wechat_agent.vision.ocr import create_ocr_engine
 from wechat_agent.workflows.send_message import SendMessageWorkflow
 
@@ -48,6 +54,34 @@ def build_parser() -> argparse.ArgumentParser:
     send_cmd.add_argument("--ocr", help="Override OCR backend (default: rapidocr)")
     send_cmd.add_argument("--cli", help="Override iphone-agent CLI path")
     send_cmd.add_argument("--url", help="Override base server URL")
+
+    # monitor (M2)
+    mon_cmd = sub.add_parser(
+        "monitor",
+        help="Run designated WeChat group monitoring (defaults to --mode observe-only)",
+    )
+    mon_cmd.add_argument("--config", type=Path, help="Path to group monitor YAML config")
+    mon_cmd.add_argument("--group", help="Override target group title")
+    mon_cmd.add_argument(
+        "--mode",
+        choices=("observe-only", "dry-run", "live"),
+        help="Monitor mode (default: observe-only)",
+    )
+    mon_cmd.add_argument(
+        "--allow-live-send",
+        action="store_true",
+        help="Required explicit safety lock alongside --mode live",
+    )
+    mon_cmd.add_argument(
+        "--gate",
+        choices=("observe_only", "rule", "llm", "hybrid", "jev"),
+        help="Override Layer-1 DecisionGate type",
+    )
+    mon_cmd.add_argument("--rules", type=Path, help="Override YAML rules file path")
+    mon_cmd.add_argument("--once", action="store_true", help="Run exactly 1 tick and exit")
+    mon_cmd.add_argument("--max-ticks", type=int, help="Maximum polling ticks before stopping")
+    mon_cmd.add_argument("--cli", help="Override iphone-agent CLI path")
+    mon_cmd.add_argument("--url", help="Override base server URL")
 
     return parser
 
@@ -142,6 +176,63 @@ def _cmd_send(args: argparse.Namespace) -> int:
     return 0 if report.succeeded else 2
 
 
+def _cmd_monitor(args: argparse.Namespace) -> int:
+    cfg = load_monitor_config(
+        args.config,
+        group_override=args.group,
+        mode_override=args.mode,
+        allow_live_send_override=bool(args.allow_live_send),
+        gate_override=args.gate,
+        rules_override=args.rules,
+        cli_override=args.cli,
+        url_override=args.url,
+    )
+    rules = load_rules_yaml(cfg.rules_path) if cfg.rules_path else []
+    llm_client = OpenAICompatibleLlmClient(cfg.llm) if cfg.llm.is_ready else None
+
+    active_group = cfg.active_group
+    gate_type = (active_group.gate if active_group and active_group.gate else cfg.default_gate)
+    mention_must_reply = (
+        active_group.mention_must_reply
+        if active_group and active_group.mention_must_reply is not None
+        else cfg.mention_must_reply
+    )
+    gate = build_decision_gate(
+        gate_type,
+        rules=rules,
+        llm_client=llm_client,
+        mention_must_reply=mention_must_reply,
+    )
+    skill_md_path = WeChatSendConfig().skills_dir() / cfg.skill_name / "SKILL.md"
+    skill_instructions = skill_md_path.read_text(encoding="utf-8") if skill_md_path.is_file() else ""
+    generator = HybridReplyGenerator(
+        RuleTemplateGenerator(rules),
+        LlmReplyGenerator(llm_client, skill_instructions=skill_instructions) if llm_client else None,
+    )
+
+    driver = IphoneAgentCliDriver(
+        cfg.iphone_agent_cli,
+        cfg.iphone_agent_url,
+        timeout=cfg.cli_timeout_seconds,
+        paste_flow_timeout=cfg.paste_flow_timeout_seconds,
+    )
+    ocr = create_ocr_engine(cfg.ocr_backend)
+    max_ticks = 1 if args.once else args.max_ticks
+
+    with MonitorStore(
+        cfg.resolved_path(cfg.state_db_path),
+        cfg.resolved_path(cfg.audit_log_path),
+    ) as store:
+        runner = MonitorRunner(driver, ocr, cfg, store, gate, generator)
+        reports = runner.run_loop(max_ticks=max_ticks)
+
+    payload = [r.to_dict() for r in reports]
+    print(json.dumps(payload[0] if (args.once and len(payload) == 1) else payload, ensure_ascii=False, indent=2))
+    if reports and reports[-1].outcome.value.startswith("halted_"):
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -152,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_doctor(cfg)
     if args.command == "send":
         return _cmd_send(args)
+    if args.command == "monitor":
+        return _cmd_monitor(args)
     parser.error(f"Unknown command: {args.command}")
     return 2
 

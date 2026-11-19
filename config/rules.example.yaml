@@ -1,0 +1,35 @@
+# M2 确定性 YAML 规则表模板（默认保守配置，按 priority 降序匹配）
+rules:
+  - id: "business_hours"
+    enabled: false                     # 默认关闭，待配置具体群与话术后开启
+    priority: 100
+    groups: []                         # 空表示适用于所有白名单群
+    require_mention: true              # 保守默认：需 @本号 才命中
+    keywords:
+      - "营业时间"
+      - "几点开门"
+      - "几点下班"
+    exclude_keywords:
+      - "退款"
+      - "投诉"
+      - "转账"
+    intent: "ask_business_hours"
+    confidence: 0.95
+    risk_score: 0.05
+    reply_templates:
+      - "@{sender} 这边营业时间可以在群公告里看下，通常工作日白天都在的。"
+
+  - id: "address_inquiry"
+    enabled: false
+    priority: 90
+    groups: []
+    require_mention: true
+    regex: "(?:地址在哪|怎么过去|具体位置)"
+    exclude_keywords:
+      - "发票"
+      - "赔偿"
+    intent: "ask_address"
+    confidence: 0.92
+    risk_score: 0.05
+    reply_templates:
+      - "@{sender} 具体位置可以点开群公告确认一下哈。"

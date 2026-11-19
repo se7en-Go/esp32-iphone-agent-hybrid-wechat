@@ -20,6 +20,7 @@ from wechat_agent.vision.ocr import OcrEngine
 from wechat_agent.vision.wechat_ui import (
     detect_existing_draft,
     detect_keyboard_and_focused_input,
+    extract_header_title,
     extract_outgoing_bubbles,
     has_exact_chat_title,
     has_new_outgoing_bubble,
@@ -126,7 +127,13 @@ class SendMessageWorkflow:
             evidence,
             rehome_retries=self.config.point_rehome_retries,
         )
-        navigator = WeChatNavigator(self.driver, self.ocr, click_chain, evidence)
+        navigator = WeChatNavigator(
+            self.driver,
+            self.ocr,
+            click_chain,
+            evidence,
+            allow_group_count=self.config.allow_group_count,
+        )
 
         # 3. Initial observe + risk phrase check
         try:
@@ -188,7 +195,11 @@ class SendMessageWorkflow:
                     time.sleep(0.25)
                     obs = self.driver.observe(image_output=evidence.image_output_path(f"02_focus_reobs_{attempt}"))
                     ocr_boxes = self.ocr.read_boxes(obs.image_bytes)
-                    if not has_exact_chat_title(ocr_boxes, clean_target):
+                    if not has_exact_chat_title(
+                        ocr_boxes,
+                        clean_target,
+                        allow_group_count=self.config.allow_group_count,
+                    ):
                         return report(
                             SendStatus.ABORTED_NAVIGATION,
                             f"Conversation title {clean_target!r} disappeared while focusing input",
@@ -242,11 +253,16 @@ class SendMessageWorkflow:
         steps.append("draft_clean")
 
         # 7. Single paste-flow execution (NEVER retry on failure)
+        expect_header_title = (
+            (extract_header_title(ocr_boxes) or clean_target)
+            if self.config.allow_group_count
+            else clean_target
+        )
         payload_path = evidence.write_payload(clean_text)
         paste_res = self.driver.paste_flow(
             payload_path,
             target_box=focused.input_box,
-            expect_title=clean_target,
+            expect_title=expect_header_title,
             caret_box=focused.caret_box,
             evidence_dir=evidence.paste_evidence_dir,
             image_output=evidence.image_output_path("03_paste_confirm"),
@@ -284,7 +300,11 @@ class SendMessageWorkflow:
                 paste_receipt=redacted_receipt,
             )
 
-        if not has_exact_chat_title(post_ocr, clean_target):
+        if not has_exact_chat_title(
+            post_ocr,
+            clean_target,
+            allow_group_count=self.config.allow_group_count,
+        ):
             return report(
                 SendStatus.ABORTED_PASTE_VERIFY,
                 f"Conversation title verification failed after paste (expected {clean_target!r})",

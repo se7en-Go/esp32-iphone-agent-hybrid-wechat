@@ -1,0 +1,378 @@
+"""WeChat group chat message extraction with bubble-color role detection and clipped-bubble filtering."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import re
+import time
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image
+
+from wechat_agent.models import Box, OcrBox
+from wechat_agent.vision.geometry import normalize_text
+
+from .models import ExtractedMessage, MessageRole
+
+ViewportItem = tuple[str, str, str]
+
+
+@dataclass(frozen=True)
+class ViewportAlignment:
+    """Result of aligning the current viewport message sequence with the previous viewport tail."""
+
+    kind: str  # "empty_curr" | "empty_prev" | "aligned" | "scroll_up" | "discontinuity"
+    overlap_len: int
+    new_start: int
+
+
+_VIEWPORT_TOP = 0.125
+_TOP_SAFE_TEXT_Y = 0.145
+_GROUP_COUNT_RE = re.compile(r"\s*\(\d+\)$")
+_SYSTEM_MSG_RE = re.compile(
+    r"^(?:"
+    r"\d{1,2}:\d{2}"
+    r"|(?:昨天|前天|今天)\s*\d{1,2}:\d{2}"
+    r"|(?:星期|周)[一二三四五六日天]\s*\d{1,2}:\d{2}"
+    r"|\d{4}年\d{1,2}月\d{1,2}日.*"
+    r"|.*(?:加入了群聊|邀请.+加入了群聊|撤回了一条消息|拍了拍|修改群名为|开启了群聊邀请确认|以下为新消息).*"
+    r")$"
+)
+
+
+def normalize_group_title(title: str) -> str:
+    """Normalize a WeChat group title, stripping trailing `(N)` member count."""
+    return _GROUP_COUNT_RE.sub("", normalize_text(title)).strip()
+
+
+def _canonical_for_hash(text: str) -> str:
+    return re.sub(r"\s+", " ", normalize_text(text))
+
+
+def compute_message_fingerprint(
+    group_title: str,
+    role: MessageRole,
+    sender: str,
+    text: str,
+    occurrence: int = 1,
+) -> str:
+    """Compute a deterministic cross-restart fingerprint for a visible message bubble."""
+    norm_group = normalize_group_title(group_title)
+    norm_sender = normalize_text(sender)
+    canon_text = _canonical_for_hash(text)
+    payload = f"{norm_group}\x1f{role.value}\x1f{norm_sender}\x1f{canon_text}\x1f{occurrence}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def message_viewport_key(msg: ExtractedMessage) -> ViewportItem:
+    """Build the ordered canonical tuple used for viewport suffix-overlap alignment."""
+    return (msg.role.value, normalize_text(msg.sender), _canonical_for_hash(msg.text))
+
+
+def compute_event_fingerprint(
+    group_title: str,
+    event_seq: int,
+    role: MessageRole,
+    sender: str,
+    text: str,
+) -> str:
+    """Compute an independent idempotency fingerprint for a newly arrived message event."""
+    norm_group = normalize_group_title(group_title)
+    norm_sender = normalize_text(sender)
+    canon_text = _canonical_for_hash(text)
+    payload = f"evt\x1f{norm_group}\x1f{int(event_seq)}\x1f{role.value}\x1f{norm_sender}\x1f{canon_text}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def align_viewport_suffix(
+    prev_items: Sequence[ViewportItem],
+    curr_items: Sequence[ViewportItem],
+) -> ViewportAlignment:
+    """Align current visible viewport items against the tail of the previous viewport."""
+    prev = list(prev_items)
+    curr = list(curr_items)
+    if not curr:
+        return ViewportAlignment("empty_curr", 0, 0)
+    if not prev:
+        return ViewportAlignment("empty_prev", 0, 0)
+
+    # 1. Primary longest suffix-prefix overlap: prev[-k:] == curr[:k]
+    for k in range(min(len(prev), len(curr)), 0, -1):
+        if prev[-k:] == curr[:k]:
+            return ViewportAlignment("aligned", k, k)
+
+    # 2. Top-edge OCR flicker tolerance: skip up to leading items if prev[-k:] == curr[j : j + k] with k >= 2
+    if len(prev) >= 2 and len(curr) >= 2:
+        for j in range(1, len(curr) - 1):
+            for k in range(min(len(prev), len(curr) - j), 1, -1):
+                if prev[-k:] == curr[j : j + k]:
+                    return ViewportAlignment("aligned", k, j + k)
+
+    # 3. Scroll-up / keyboard-obscured subset detection (never lose viewport tail anchor)
+    if len(curr) < len(prev):
+        for i in range(len(prev) - len(curr) + 1):
+            if prev[i : i + len(curr)] == curr:
+                return ViewportAlignment("scroll_up", len(curr), len(curr))
+
+    for m in range(min(len(prev), len(curr)), 1, -1):
+        if prev[:m] == curr[-m:]:
+            return ViewportAlignment("scroll_up", m, len(curr))
+
+    return ViewportAlignment("discontinuity", 0, len(curr))
+
+
+def mentions_any_alias(text: str, self_aliases: tuple[str, ...] | list[str]) -> bool:
+    """Return True if `text` contains `@alias` (supports ASCII `@`, fullwidth `＠`, and WeChat `\\u2005`)."""
+    norm_text = normalize_text(text)
+    if not norm_text or not self_aliases:
+        return False
+    for raw_alias in self_aliases:
+        alias = normalize_text(raw_alias)
+        if not alias:
+            continue
+        pattern = re.compile(r"[@＠]" + re.escape(alias) + r"(?:$|[\s\u2005,，。!！?？:：;；、)])")
+        if pattern.search(norm_text):
+            return True
+    return False
+
+
+def _decode_rgb(image_bytes: bytes) -> np.ndarray | None:
+    if not image_bytes:
+        return None
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        return np.asarray(img.convert("RGB"))
+
+
+def _norm_box_to_pixels(box: Box, width: int, height: int) -> tuple[int, int, int, int]:
+    x0 = max(0, min(width - 1, int(round(box.left * width))))
+    y0 = max(0, min(height - 1, int(round(box.top * height))))
+    x1 = max(x0 + 1, min(width, int(round(box.right * width))))
+    y1 = max(y0 + 1, min(height, int(round(box.bottom * height))))
+    return x0, y0, x1, y1
+
+
+def _estimate_canvas_luminance(rgb: np.ndarray, bottom_limit: float) -> float:
+    h, w, _ = rgb.shape
+    y0 = max(0, int(round(_VIEWPORT_TOP * h)))
+    y1 = max(y0 + 1, int(round(bottom_limit * h)))
+    left_strip = rgb[y0:y1, 0 : max(2, int(0.03 * w))]
+    right_strip = rgb[y0:y1, min(w - 2, int(0.97 * w)) : w]
+    samples = np.concatenate([left_strip.reshape(-1, 3), right_strip.reshape(-1, 3)], axis=0)
+    return float(np.median(samples.mean(axis=1))) if samples.size else 237.0
+
+
+def _bubble_ratios(rgb: np.ndarray, box: Box, canvas_lum: float) -> tuple[float, float]:
+    """Return `(green_ratio, incoming_white_ratio)` inside a padded probe box."""
+    h, w, _ = rgb.shape
+    probe = Box.clamped(
+        max(0.0, box.left - 0.015),
+        max(_VIEWPORT_TOP, box.top - 0.008),
+        min(1.0, box.right + 0.015),
+        min(1.0, box.bottom + 0.008),
+    )
+    x0, y0, x1, y1 = _norm_box_to_pixels(probe, w, h)
+    patch = rgb[y0:y1, x0:x1].astype(np.int16)
+    if patch.size == 0:
+        return 0.0, 0.0
+    green_mask = (patch[:, :, 1] - patch[:, :, 0] >= 12) & (patch[:, :, 1] - patch[:, :, 2] >= 12)
+    green_ratio = float(green_mask.mean())
+
+    if canvas_lum < 90.0:
+        # Dark mode incoming bubble is a raised card brighter than dark canvas, without strong green tint.
+        lum = patch.mean(axis=2)
+        white_mask = (lum >= canvas_lum + 8.0) & (~green_mask)
+    else:
+        white_thresh = max(246, int(round(canvas_lum + 6)))
+        white_mask = (
+            (patch[:, :, 0] >= white_thresh)
+            & (patch[:, :, 1] >= white_thresh)
+            & (patch[:, :, 2] >= white_thresh)
+            & (~green_mask)
+        )
+    return green_ratio, float(white_mask.mean())
+
+
+def _is_top_clipped_bubble(rgb: np.ndarray | None, box: Box, canvas_lum: float) -> bool:
+    """Detect bubbles clipped by the top header bar so partial scrolled-off messages are ignored."""
+    if box.top <= _TOP_SAFE_TEXT_Y:
+        return True
+    if rgb is None or box.top > 0.195:
+        return False
+    h, w, _ = rgb.shape
+    # Sample from the chat viewport top edge down to the OCR box top to see if bubble fill touches the header.
+    strip = Box.clamped(box.left, _VIEWPORT_TOP, box.right, box.top)
+    x0, y0, x1, y1 = _norm_box_to_pixels(strip, w, h)
+    if y1 <= y0 + 1:
+        return True
+    patch = rgb[y0:y1, x0:x1].astype(np.int16)
+    green_mask = (patch[:, :, 1] - patch[:, :, 0] >= 12) & (patch[:, :, 1] - patch[:, :, 2] >= 12)
+    if canvas_lum < 90.0:
+        bubble_mask = green_mask | (patch.mean(axis=2) >= canvas_lum + 8.0)
+    else:
+        white_thresh = max(246, int(round(canvas_lum + 6)))
+        bubble_mask = green_mask | (
+            (patch[:, :, 0] >= white_thresh)
+            & (patch[:, :, 1] >= white_thresh)
+            & (patch[:, :, 2] >= white_thresh)
+        )
+    row_bubble_frac = bubble_mask.mean(axis=1)
+    # If the very top rows against the header are already bubble-colored and stay continuous down to the text,
+    # this bubble's upper section is clipped off-screen.
+    return bool((row_bubble_frac[:2].mean() >= 0.30) and (row_bubble_frac.min() >= 0.25))
+
+
+class ChatMessageExtractor:
+    """Extracts structured group chat messages from screenshots + OCR detections."""
+
+    def extract(
+        self,
+        image_bytes: bytes,
+        ocr_boxes: list[OcrBox],
+        *,
+        group_title: str,
+        self_aliases: tuple[str, ...] = (),
+        bottom_limit: float = 0.875,
+        captured_at: float | None = None,
+    ) -> list[ExtractedMessage]:
+        ts = time.time() if captured_at is None else float(captured_at)
+        norm_group = normalize_group_title(group_title)
+        rgb = _decode_rgb(image_bytes)
+        canvas_lum = _estimate_canvas_luminance(rgb, bottom_limit) if rgb is not None else 237.0
+
+        self_items: list[OcrBox] = []
+        incoming_items: list[OcrBox] = []
+        canvas_labels: list[OcrBox] = []
+        clipped_regions: list[Box] = []
+
+        for item in ocr_boxes:
+            text = normalize_text(item.text)
+            if not text:
+                continue
+            cy = item.box.center[1]
+            if cy <= _VIEWPORT_TOP or cy >= bottom_limit:
+                continue
+            if item.box.bottom >= bottom_limit - 0.008:
+                continue
+            if _is_top_clipped_bubble(rgb, item.box, canvas_lum):
+                clipped_regions.append(item.box)
+                continue
+
+            if rgb is not None:
+                green_r, white_r = _bubble_ratios(rgb, item.box, canvas_lum)
+                if item.box.right >= 0.42 and green_r >= 0.15:
+                    self_items.append(item)
+                    continue
+                if item.box.left <= 0.56 and white_r >= 0.18:
+                    incoming_items.append(item)
+                    continue
+                if not _SYSTEM_MSG_RE.match(text):
+                    canvas_labels.append(item)
+            else:
+                if _SYSTEM_MSG_RE.match(text):
+                    continue
+                if item.box.center[0] >= 0.56 and item.box.right >= 0.42:
+                    self_items.append(item)
+                elif item.box.left <= 0.34:
+                    incoming_items.append(item)
+
+        def _overlaps_clipped_group(box: Box) -> bool:
+            for cbox in clipped_regions:
+                if 0 <= (box.top - cbox.bottom) <= 0.032 and abs(box.left - cbox.left) <= 0.08:
+                    return True
+            return False
+
+        self_items = [b for b in self_items if not _overlaps_clipped_group(b.box)]
+        incoming_items = [b for b in incoming_items if not _overlaps_clipped_group(b.box)]
+
+        messages: list[ExtractedMessage] = []
+        for role, items in ((MessageRole.SELF, self_items), (MessageRole.INCOMING, incoming_items)):
+            if not items:
+                continue
+            items.sort(key=lambda b: (round(b.box.top, 3), round(b.box.left, 3)))
+            groups: list[list[OcrBox]] = [[items[0]]]
+            for item in items[1:]:
+                prev = groups[-1][-1]
+                vgap = item.box.top - prev.box.bottom
+                if role == MessageRole.SELF:
+                    aligned = abs(item.box.right - prev.box.right) <= 0.12
+                else:
+                    aligned = abs(item.box.left - prev.box.left) <= 0.09
+                if -0.005 <= vgap <= 0.032 and aligned:
+                    groups[-1].append(item)
+                else:
+                    groups.append([item])
+
+            for grp in groups:
+                combined_box = Box.clamped(
+                    min(b.box.left for b in grp),
+                    min(b.box.top for b in grp),
+                    max(b.box.right for b in grp),
+                    max(b.box.bottom for b in grp),
+                )
+                joined = "\n".join(b.text.strip() for b in grp if b.text.strip())
+                sender = ""
+                if role == MessageRole.INCOMING:
+                    sender = _find_sender_label(combined_box, canvas_labels)
+                mentioned = role == MessageRole.INCOMING and mentions_any_alias(joined, self_aliases)
+                messages.append(
+                    ExtractedMessage(
+                        group_title=norm_group,
+                        role=role,
+                        text=joined,
+                        sender=sender,
+                        box=combined_box,
+                        mentioned_self=mentioned,
+                        fingerprint="",
+                        captured_at=ts,
+                    )
+                )
+
+        messages.sort(key=lambda m: (round(m.box.top if m.box else 0.0, 4), round(m.box.left if m.box else 0.0, 4)))
+
+        occ_counts: Counter[tuple[str, str, str, str]] = Counter()
+        finalized: list[ExtractedMessage] = []
+        for msg in messages:
+            key = (norm_group, msg.role.value, normalize_text(msg.sender), _canonical_for_hash(msg.text))
+            occ_counts[key] += 1
+            fp = compute_message_fingerprint(
+                norm_group,
+                msg.role,
+                msg.sender,
+                msg.text,
+                occurrence=occ_counts[key],
+            )
+            finalized.append(
+                ExtractedMessage(
+                    group_title=msg.group_title,
+                    role=msg.role,
+                    text=msg.text,
+                    sender=msg.sender,
+                    box=msg.box,
+                    mentioned_self=msg.mentioned_self,
+                    fingerprint=fp,
+                    captured_at=msg.captured_at,
+                )
+            )
+        return finalized
+
+
+def _find_sender_label(bubble_box: Box, canvas_labels: list[OcrBox]) -> str:
+    """Attach a grey-canvas sender nickname sitting directly above an incoming white bubble."""
+    best: OcrBox | None = None
+    best_gap = 1.0
+    for lbl in canvas_labels:
+        gap = bubble_box.top - lbl.box.bottom
+        if not (0.002 <= gap <= 0.044):
+            continue
+        if abs(lbl.box.left - bubble_box.left) > 0.08:
+            continue
+        if lbl.box.left > 0.45:
+            continue
+        if gap < best_gap:
+            best_gap = gap
+            best = lbl
+    return normalize_text(best.text) if best is not None else ""

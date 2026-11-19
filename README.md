@@ -11,19 +11,25 @@
 ## 目录结构
 
 ```text
-├── config/                  # 配置模板（M1 默认白名单仅「文件传输助手」）
-├── skills/                  # 通过 HIDAGENT_SKILLS 优先挂载到底座的 Skill 定义
-│   ├── wechat-send/         # M1 通用微信发消息规范
-│   └── wechat-group-reply/  # M2 群监控与自动回复规范（优先覆盖底座占位）
+├── config/
+│   ├── wechat-send.example.yaml     # M1 通用发消息配置模板
+│   ├── group-monitor.example.yaml   # M2 群监控配置模板（默认 observe-only）
+│   └── rules.example.yaml           # M2 确定性 YAML 规则模板
+├── skills/                          # 通过 HIDAGENT_SKILLS 优先挂载到底座的 Skill 定义
+│   ├── wechat-send/                 # M1 通用微信发消息规范
+│   └── wechat-group-reply/          # M2 群监控与自动回复规范（优先覆盖底座占位）
 ├── scripts/
-│   └── check-mount.sh       # 只读检查底座 8890 状态、staged-v1 与 HIDAGENT_SKILLS 挂载
+│   └── check-mount.sh               # 只读检查底座 8890 状态、staged-v1 与 HIDAGENT_SKILLS 挂载
 ├── src/wechat_agent/
-│   ├── adapters/            # 唯一底座 CLI 适配层
-│   ├── vision/              # 本仓独立 OCR（RapidOCR + 预留 Apple Vision 接口）与微信界面几何解析
-│   ├── guards/              # 目标白名单硬门禁、Skill 熔断/限流守卫
-│   ├── workflows/           # M1 紧连点击链、微信导航、发消息安全状态机
-│   └── cli.py               # `wechat-agent` CLI（doctor / verify-skills / send）
-└── tests/                   # M1 完整离线单元测试与合成页面夹具
+│   ├── adapters/                    # 唯一底座 CLI 适配层
+│   ├── vision/                      # 本仓独立 OCR（RapidOCR + Apple Vision 协议）与微信界面几何解析
+│   ├── guards/                      # 目标白名单、Skill 熔断限流、M2 双层频控与违禁词守卫
+│   ├── workflows/                   # M1 紧连点击链、微信导航、发消息安全状态机
+│   ├── monitor/                     # M2 群聊提取、SQLite 跨重启去重、两级决策/生成框架、监控循环
+│   │   ├── decision/                # Layer 1: DecisionGate (rule / llm / hybrid / jev 扩展槽)
+│   │   └── generators/              # Layer 2: ReplyGenerator (rule_template / llm / hybrid)
+│   └── cli.py                       # `wechat-agent` CLI（doctor / verify-skills / send / monitor）
+└── tests/                           # 完整离线单元测试与多帧 Mock 回放测试
 ```
 
 ## 安装与环境准备
@@ -51,7 +57,7 @@ export HIDAGENT_SKILLS=/Users/seven/Documents/esp32-iphone-agent-hybrid-wechat/s
 .venv/bin/wechat-agent doctor
 ```
 
-## M1 CLI 用法
+## M1 CLI 用法（通用发消息）
 
 1. **默认 `--dry-run` 模式（只贴不发，核对正文后安全停在发送前）**：
 
@@ -65,12 +71,22 @@ export HIDAGENT_SKILLS=/Users/seven/Documents/esp32-iphone-agent-hybrid-wechat/s
 .venv/bin/wechat-agent send --target "文件传输助手" --text "测试消息：真机验收" --send
 ```
 
+## M2 CLI 用法（指定群监控与两级混合自动回复）
+
+M2 采用两级架构：**Layer 1 `DecisionGate`**（输出统一结构化决策 `should_reply / intent / confidence / risk_score / matched_rule / reason`，预留 `jev` 扩展槽位兼容 `Noul / Choice / Score` 语义）+ **Layer 2 `ReplyGenerator`**（YAML 规则模板 + 可选 OpenAI 兼容 LLM 生成器，经 `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` 启用）。
+
+- **默认 `observe-only` 只看不发**（仅记录提取消息、意图判定与拟回复文案到 `.local-data/state/monitor_audit.jsonl`）：
+
+```sh
+.venv/bin/wechat-agent monitor --config config/group-monitor.local.yaml --once
+```
+
+- **安全红线**：
+  - 对任何真实微信群，`observe-only` 和 `dry-run` 都**只做只读观察与审计日志记录，绝不聚焦输入框或粘贴草稿**。
+  - 只有显式传 `--mode live --allow-live-send` 且配置了 `target_groups` 与非 `observe_only` 决策器时才会通过 M1 安全状态机发出回复。
+  - **长时挂机注意事项**：如需长时间无人值守驻留监控，请提前将 iPhone「设置 → 显示与亮度 → 自动锁定」设为 **「永不」**；监控循环遇到锁屏、离开目标群或非微信界面会自动安全暂停，绝不盲目点击。
+
 ## 隐私与证据留存
 
-- 所有截图、OCR 核对摘要与 `paste-flow` 完整 JSON 回执均保存在仓库 `.local-data/runs/<run_id>/`（目录权限 `0700`，文件权限 `0600`），严禁写入 `/tmp`。
+- 运行截图与回执保存在 `.local-data/runs/<run_id>/`（目录 `0700`、文件 `0600`），M2 SQLite WAL 状态库与审计日志保存在 `.local-data/state/`（`0700` / `0600`），严禁写入 `/tmp`。
 - 导出日志自动对 `transaction_id` 及敏感字段做脱敏处理；`.local-data/` 已被 `.gitignore` 忽略。
-
-## 路线图
-
-- **M1（当前阶段）**：通用微信发消息 Skill + CLI + 完整离线单测 + 「文件传输助手」真机验收。
-- **M2（M1 稳固后推进）**：指定群监控循环、消息增量提取、SQLite 跨重启去重、单群/全局冷却频控与可插拔 `Responder` 策略框架（默认 `observe-only`）。
