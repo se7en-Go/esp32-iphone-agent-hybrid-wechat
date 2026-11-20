@@ -181,3 +181,38 @@ def test_store_viewport_event_seq_recent_content_and_legacy_migration(tmp_path: 
         assert store2.has_recent_message_content(
             "示例分享•测试3群（198）", MessageRole.INCOMING, "", "在吗", since_ts=105.0
         ) is False
+
+
+def test_store_pending_queue_burst_merge_priority_and_ttl_expiry(tmp_path: Path) -> None:
+    db_path = tmp_path / "state" / "pq.db"
+    g = "示例分享•测试3群（198）"
+    m_normal = ExtractedMessage(g, MessageRole.INCOMING, "价格多少", sender="测试群友A", mentioned_self=False, fingerprint="pq-1")
+    m_burst = ExtractedMessage(g, MessageRole.INCOMING, "@示例助手", sender="测试群友A", mentioned_self=True, fingerprint="pq-2")
+    m_other = ExtractedMessage(g, MessageRole.INCOMING, "请问活动规则", sender="测试群友B", mentioned_self=False, fingerprint="pq-3")
+    m_other_mention = ExtractedMessage(g, MessageRole.INCOMING, "@示例助手 帮查一下", sender="测试群友C", mentioned_self=True, fingerprint="pq-4")
+
+    with MonitorStore(db_path) as store:
+        fp_a = store.enqueue_pending(m_normal, ttl_seconds=180.0, burst_merge_window_seconds=5.0, now=1000.0)
+        fp_a2 = store.enqueue_pending(m_burst, ttl_seconds=180.0, burst_merge_window_seconds=5.0, now=1003.0)
+        assert fp_a == fp_a2 == "pq-1"
+        store.enqueue_pending(m_other, ttl_seconds=180.0, burst_merge_window_seconds=5.0, now=1010.0)
+        store.enqueue_pending(m_other_mention, ttl_seconds=180.0, burst_merge_window_seconds=5.0, now=1015.0)
+
+    with MonitorStore(db_path) as store2:
+        pending = store2.list_pending(g, now=1020.0)
+        # Priority: @self first (pq-1, pq-4 FIFO), then non-mention (pq-3)
+        assert [(p.fingerprint, p.text, p.mentioned_self) for p in pending] == [
+            ("pq-1", "价格多少\n@示例助手", True),
+            ("pq-4", "@示例助手 帮查一下", True),
+            ("pq-3", "请问活动规则", False),
+        ]
+        store2.mark_pending_status("pq-1", "processed", now=1025.0)
+        assert [p.fingerprint for p in store2.list_pending(g, now=1025.0)] == ["pq-4", "pq-3"]
+
+        # Advance past 180s TTL of pq-4 (expires at 1015+180=1195) and pq-3 (1010+180=1190) -> all expired
+        assert store2.list_pending(g, now=1200.0) == []
+        assert store2.has_pending(g, now=1200.0) is False
+        statuses = dict(
+            store2._conn.execute("SELECT fingerprint, status FROM pending_queue ORDER BY id ASC").fetchall()
+        )
+        assert statuses == {"pq-1": "processed", "pq-3": "expired", "pq-4": "expired"}

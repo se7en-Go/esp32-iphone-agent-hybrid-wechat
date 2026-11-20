@@ -260,3 +260,48 @@ def test_role_prompt_injection_and_omission_in_llm_prompts() -> None:
     no_role = _ctx("请问周末几点开", role_prompt="")
     assert "业务职责与静默边界" not in gate.build_messages(no_role)[1]["content"]
     assert "业务职责与静默边界" not in gen.build_messages(no_role, dec)[1]["content"]
+
+
+def test_llm_defaults_and_length_truncation_raises_and_fails_closed(monkeypatch) -> None:
+    cfg = LlmConfig(
+        enabled=True,
+        base_url="https://api.deepseek.com/v1",
+        api_key="sk-test-only",
+        model="deepseek-flash",
+    )
+    assert cfg.max_tokens == 2048
+    assert cfg.timeout_seconds == 30.0
+
+    class _TruncatedResp:
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"role": "assistant", "content": "", "reasoning_content": "thinking..."},
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=30.0: _TruncatedResp())
+    client = OpenAICompatibleLlmClient(cfg)
+    try:
+        client.chat_completion([{"role": "user", "content": "hi"}], json_mode=True)
+    except LlmClientError as exc:
+        msg = str(exc)
+        assert "finish_reason='length'" in msg and "2048" in msg
+    else:
+        raise AssertionError("Expected LlmClientError on truncated empty content")
+
+    gate_res = LlmIntentGate(client).evaluate(_ctx("请问价格多少"))
+    assert gate_res.should_reply is False
+    assert gate_res.risk_score == 1.0
+    assert "2048" in gate_res.reason

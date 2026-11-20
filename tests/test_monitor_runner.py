@@ -306,7 +306,12 @@ def test_group_monitor_example_config_and_send_error_halt(tmp_path: Path) -> Non
     assert example.allow_live_send is False
     assert example.target_groups == ()
     assert example.llm.enabled is False
-    assert (example.poll_interval_min_seconds, example.poll_interval_max_seconds) == (8.0, 12.0)
+    assert example.llm.max_tokens == 2048
+    assert example.llm.timeout_seconds == 30.0
+    assert (example.poll_interval_min_seconds, example.poll_interval_max_seconds) == (2.0, 3.0)
+    assert example.pending_ttl_seconds == 180.0
+    assert example.burst_merge_window_seconds == 5.0
+    assert example.short_discontinuity_window_seconds == 90.0
     assert example.rate_limits.per_group_cooldown_seconds == 60.0
     assert example.rate_limits.per_group_max_per_hour == 6
     assert example.rate_limits.global_min_interval_seconds == 15.0
@@ -453,7 +458,8 @@ def test_repeated_identical_phrase_and_discontinuity_and_scroll_up(tmp_path: Pat
             ("incoming", "", "在吗"),
         ]
 
-        # Complete discontinuity re-anchors safely without blasting replies
+        # Complete discontinuity after long gap (> 90s) re-anchors safely without blasting replies
+        now["t"] += 120.0
         r6 = runner2.run_tick(6)
         assert r6.outcome == TickOutcome.BASELINE_SEEDED
         assert "discontinuity" in r6.message
@@ -634,5 +640,221 @@ def test_group_title_with_owned_number_matches_live_count_and_isolates_sibling_g
         # Sibling group (199) MUST be detected as having left target group (198)
         r2 = runner.run_tick(2)
         assert r2.outcome == TickOutcome.PAUSED_LEFT_GROUP
+
+
+def test_static_frame_skips_ocr_and_resumes_when_viewport_changes(tmp_path: Path) -> None:
+    class _CountingOcr(MockOcrEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def read_boxes(self, image_bytes: bytes) -> list[OcrBox]:
+            self.calls += 1
+            return super().read_boxes(image_bytes)
+
+    driver = FakePhoneDriver()
+    ocr = _CountingOcr()
+    gate, gen = _rules_gate_and_gen()
+
+    f_base = _group_frame(ocr, header="示例测试群(12)", incoming=[("测试群友A", "大家好", Box(0.14, 0.25, 0.45, 0.31))])
+    f_new = _group_frame(
+        ocr,
+        header="示例测试群(12)",
+        incoming=[
+            ("测试群友A", "大家好", Box(0.14, 0.25, 0.45, 0.31)),
+            ("测试群友B", "请问营业时间", Box(0.14, 0.38, 0.56, 0.44)),
+        ],
+    )
+    driver.observe_queue = [
+        Observation("o0", f_base),
+        Observation("o1", f_base),  # static idle -> MUST skip OCR
+        Observation("o2", f_base),  # static idle -> MUST skip OCR
+        Observation("o3", f_new),   # bubble appeared -> MUST run OCR
+    ]
+
+    now = {"t": 1000.0}
+    cfg = _monitor_cfg(tmp_path, mode=MonitorMode.DRY_RUN, group_name="示例测试群")
+    with MonitorStore(cfg.state_db_path, cfg.audit_log_path) as store:
+        runner = MonitorRunner(driver, ocr, cfg, store, gate, gen, clock=lambda: now["t"])
+        assert runner.run_tick(0).outcome == TickOutcome.BASELINE_SEEDED
+        assert ocr.calls == 1
+
+        now["t"] += 2.5
+        r1 = runner.run_tick(1)
+        assert r1.outcome == TickOutcome.NO_NEW_MESSAGES
+        assert "skipped OCR" in r1.message
+        assert ocr.calls == 1
+
+        now["t"] += 2.5
+        r2 = runner.run_tick(2)
+        assert r2.outcome == TickOutcome.NO_NEW_MESSAGES
+        assert ocr.calls == 1
+
+        now["t"] += 2.5
+        r3 = runner.run_tick(3)
+        assert r3.outcome == TickOutcome.DRY_RUN_LOGGED
+        assert ocr.calls == 2
+        assert r3.reply_text == "@测试群友B 白天9点到晚上8点都在"
+
+
+def test_same_sender_burst_merge_and_pending_queue_drain_after_cooldown_and_ttl_expiry(
+    tmp_path: Path,
+) -> None:
+    from tests.fakes import make_keyboard_chat_image
+
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    gate, gen = _rules_gate_and_gen()
+
+    f_base = _group_frame(ocr, header="示例测试群(12)", incoming=[])
+    # Burst frame:
+    # - 群友A sends 2 adjacent bubbles ("请问营业时间" + "@运营助手") -> MUST merge into 1 reply
+    # - 群友B asks "明天营业时间呢" -> queued for after cooldown
+    # - 群友C (unrelated question matching "营业时间" later to test TTL)
+    f_burst = _group_frame(
+        ocr,
+        header="示例测试群(12)",
+        incoming=[
+            ("测试群友A", "请问营业时间", Box(0.14, 0.20, 0.56, 0.25)),
+            ("测试群友A", "@运营助手", Box(0.14, 0.29, 0.42, 0.34)),
+            ("测试群友B", "明天营业时间是几点", Box(0.14, 0.40, 0.62, 0.46)),
+            ("测试群友C", "周日营业时间也是吗", Box(0.14, 0.52, 0.62, 0.58)),
+        ],
+    )
+
+    kb_empty = make_keyboard_chat_image(blue_send=True, with_caret=True)
+    ocr.register(
+        kb_empty,
+        [
+            OcrBox("示例测试群(12)", Box(0.32, 0.06, 0.68, 0.09)),
+            OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+            OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+        ],
+    )
+
+    def reg_live_frames(reply_text: str, suffix: bytes) -> tuple[bytes, bytes]:
+        kb_p = kb_empty + b"p" + suffix
+        ocr.register(
+            kb_p,
+            [
+                OcrBox("示例测试群(12)", Box(0.32, 0.06, 0.68, 0.09)),
+                OcrBox(reply_text, Box(0.18, 0.53, 0.58, 0.55)),
+                OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+                OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+            ],
+        )
+        sent = make_collapsed_chat_image(outgoing_boxes=[Box(0.46, 0.66, 0.88, 0.72)]) + suffix
+        ocr.register(
+            sent,
+            [
+                OcrBox("示例测试群(12)", Box(0.32, 0.06, 0.68, 0.09)),
+                OcrBox(reply_text, Box(0.49, 0.672, 0.85, 0.705)),
+            ],
+        )
+        return kb_p, sent
+
+    p1, s1 = reg_live_frames("@测试群友A 白天9点到晚上8点都在", b"1")
+    p2, s2 = reg_live_frames("@测试群友B 白天9点到晚上8点都在", b"2")
+
+    driver.observe_queue = [
+        Observation("o0", f_base),   # tick 0 baseline
+        Observation("o1", f_burst),  # tick 1 runner sees burst -> replies live to A
+        Observation("w1", f_burst),  # workflow 1 initial
+        Observation("w1p", p1),      # workflow 1 post-paste
+        Observation("o2", f_burst),  # tick 2 during cooldown (10s later) -> SKIPPED_COOLDOWN keeping B,C pending
+        Observation("o3", f_burst),  # tick 3 after cooldown (70s later) -> drains B live
+        Observation("w2", f_burst),  # workflow 2 initial
+        Observation("w2p", p2),      # workflow 2 post-paste
+        Observation("o4", f_burst),  # tick 4 at +200s (> 180s TTL of C) -> C expired -> NO_NEW_MESSAGES
+    ]
+    click_seq = [
+        ClickResult("c1k", clicked=True, command_acknowledged=True, image_bytes=kb_empty),
+        ClickResult("c1s", clicked=True, command_acknowledged=True, effect_verified=True, image_bytes=s1),
+        ClickResult("c2k", clicked=True, command_acknowledged=True, image_bytes=kb_empty),
+        ClickResult("c2s", clicked=True, command_acknowledged=True, effect_verified=True, image_bytes=s2),
+    ]
+    driver.click_handler = lambda *args: click_seq.pop(0)
+
+    now = {"t": 2000.0}
+    cfg = _monitor_cfg(tmp_path, mode=MonitorMode.LIVE, allow_live_send=True, group_name="示例测试群")
+    with MonitorStore(cfg.state_db_path, cfg.audit_log_path) as store:
+        runner = MonitorRunner(driver, ocr, cfg, store, gate, gen, clock=lambda: now["t"])
+        assert runner.run_tick(0).outcome == TickOutcome.BASELINE_SEEDED
+
+        now["t"] += 3.0
+        r1 = runner.run_tick(1)
+        assert r1.outcome == TickOutcome.REPLIED
+        assert r1.reply_text == "@测试群友A 白天9点到晚上8点都在"
+
+        # Within 60s per-group cooldown -> SKIPPED_COOLDOWN (B & C remain pending)
+        now["t"] += 15.0
+        r2 = runner.run_tick(2)
+        assert r2.outcome == TickOutcome.SKIPPED_COOLDOWN
+
+        # After 60s cooldown (elapsed 70s) -> drains 测试群友B cleanly!
+        now["t"] += 55.0
+        r3 = runner.run_tick(3)
+        assert r3.outcome == TickOutcome.REPLIED
+        assert r3.reply_text == "@测试群友B 白天9点到晚上8点都在"
+
+        # After 180s TTL (2000+3+180=2183, advance to 2200) -> 测试群友C expired automatically!
+        now["t"] += 130.0
+        r4 = runner.run_tick(4)
+        assert r4.outcome == TickOutcome.NO_NEW_MESSAGES
+        rows = dict(store._conn.execute("SELECT sender, status FROM pending_queue ORDER BY id ASC").fetchall())
+        assert rows == {"测试群友A": "processed", "测试群友B": "processed", "测试群友C": "expired"}
+
+
+def test_short_interval_burst_discontinuity_recovers_unseen_tail_and_mentions(tmp_path: Path) -> None:
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    gate, gen = _rules_gate_and_gen()
+
+    f_prev = _group_frame(
+        ocr,
+        header="示例测试群(12)",
+        incoming=[("老用户", "之前讨论完毕", Box(0.14, 0.25, 0.50, 0.31))],
+    )
+    # Full screen jumped with ZERO overlap, including an earlier @self question + trailing messages
+    f_burst_jump = _group_frame(
+        ocr,
+        header="示例测试群(12)",
+        incoming=[
+            ("路人甲", "刷屏消息1", Box(0.14, 0.19, 0.44, 0.24)),
+            ("测试群友D", "@运营助手\u2005请问营业时间", Box(0.14, 0.29, 0.65, 0.34)),
+            ("路人乙", "刷屏消息2", Box(0.14, 0.39, 0.44, 0.44)),
+            ("路人丙", "刷屏消息3", Box(0.14, 0.49, 0.44, 0.54)),
+            ("路人丁", "刷屏消息4", Box(0.14, 0.59, 0.44, 0.64)),
+        ],
+    )
+    # A second full-screen jump much later (> 90s) -> safely re-anchors without replying
+    f_long_jump = _group_frame(
+        ocr,
+        header="示例测试群(12)",
+        incoming=[("测试群友E", "@运营助手\u2005营业时间呢", Box(0.14, 0.25, 0.62, 0.31))],
+    )
+    driver.observe_queue = [
+        Observation("s0", f_prev),
+        Observation("s1", f_burst_jump),
+        Observation("s2", f_long_jump),
+    ]
+
+    now = {"t": 1000.0}
+    cfg = _monitor_cfg(tmp_path, mode=MonitorMode.DRY_RUN, group_name="示例测试群")
+    with MonitorStore(cfg.state_db_path, cfg.audit_log_path) as store:
+        runner = MonitorRunner(driver, ocr, cfg, store, gate, gen, clock=lambda: now["t"])
+        assert runner.run_tick(0).outcome == TickOutcome.BASELINE_SEEDED
+
+        # 45s later (<= 90s short_discontinuity_window_seconds): MUST recover @运营助手 (测试群友D)!
+        now["t"] += 45.0
+        r1 = runner.run_tick(1)
+        assert r1.outcome == TickOutcome.DRY_RUN_LOGGED
+        assert r1.reply_text == "@测试群友D 白天9点到晚上8点都在"
+
+        # 120s later (> 90s): long discontinuity safely re-anchors baseline without blasting replies
+        now["t"] += 120.0
+        r2 = runner.run_tick(2)
+        assert r2.outcome == TickOutcome.BASELINE_SEEDED
+        assert "discontinuity" in r2.message
 
 

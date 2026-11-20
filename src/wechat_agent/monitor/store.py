@@ -113,10 +113,30 @@ class MonitorStore:
                 """
             )
             self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT UNIQUE NOT NULL,
+                    group_title TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    mentioned_self INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_seen_group_time ON seen_messages(group_title, id)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_send_events_time ON send_events(sent_at, group_title)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pending_group_status "
+                "ON pending_queue(group_title, status, mentioned_self DESC, id ASC)"
             )
 
     def close(self) -> None:
@@ -446,6 +466,159 @@ class MonitorStore:
             (norm,),
         ).fetchone()
         return float(row["takeover_until"]) if row else 0.0
+
+    def get_last_seen_at(self, group_title: str) -> float:
+        norm = canonicalize_chat_title(group_title)
+        row = self._conn.execute(
+            "SELECT last_seen_at FROM group_state WHERE group_title = ?",
+            (norm,),
+        ).fetchone()
+        return float(row["last_seen_at"]) if row else 0.0
+
+    def touch_last_seen(self, group_title: str, now: float | None = None) -> None:
+        ts = time.time() if now is None else float(now)
+        with self._conn:
+            norm = self._ensure_group_row(group_title)
+            self._conn.execute(
+                "UPDATE group_state SET last_seen_at = ? WHERE group_title = ?",
+                (ts, norm),
+            )
+
+    def _expire_pending_locked(self, norm_group: str, ts: float) -> int:
+        cur = self._conn.execute(
+            """
+            UPDATE pending_queue
+            SET status = 'expired', updated_at = ?
+            WHERE group_title = ? AND status = 'pending' AND expires_at <= ?
+            """,
+            (ts, norm_group, ts),
+        )
+        return int(cur.rowcount or 0)
+
+    def expire_pending(self, group_title: str, *, now: float | None = None) -> int:
+        ts = time.time() if now is None else float(now)
+        norm_group = canonicalize_chat_title(group_title)
+        with self._conn:
+            return self._expire_pending_locked(norm_group, ts)
+
+    def enqueue_pending(
+        self,
+        msg: ExtractedMessage,
+        *,
+        ttl_seconds: float = 180.0,
+        burst_merge_window_seconds: float = 5.0,
+        now: float | None = None,
+    ) -> str:
+        """Enqueue an incoming message, merging rapid adjacent messages from the same non-empty sender."""
+        ts = time.time() if now is None else float(now)
+        ttl = max(1.0, float(ttl_seconds))
+        norm_group = canonicalize_chat_title(msg.group_title)
+        norm_sender = normalize_text(msg.sender)
+        with self._conn:
+            self._expire_pending_locked(norm_group, ts)
+            if norm_sender:
+                latest = self._conn.execute(
+                    """
+                    SELECT id, fingerprint, sender, text, mentioned_self, updated_at
+                    FROM pending_queue
+                    WHERE group_title = ? AND status = 'pending'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (norm_group,),
+                ).fetchone()
+                if (
+                    latest is not None
+                    and normalize_text(str(latest["sender"] or "")) == norm_sender
+                    and 0.0 <= (ts - float(latest["updated_at"])) <= burst_merge_window_seconds
+                ):
+                    prev_text = str(latest["text"] or "")
+                    merged_text = (
+                        f"{prev_text}\n{msg.text}" if prev_text and msg.text else (prev_text or msg.text)
+                    )
+                    merged_mention = 1 if (latest["mentioned_self"] or msg.mentioned_self) else 0
+                    self._conn.execute(
+                        """
+                        UPDATE pending_queue
+                        SET text = ?, mentioned_self = ?, expires_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (merged_text, merged_mention, ts + ttl, ts, int(latest["id"])),
+                    )
+                    return str(latest["fingerprint"])
+
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO pending_queue
+                    (fingerprint, group_title, sender, text, mentioned_self, status, created_at, expires_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    msg.fingerprint,
+                    norm_group,
+                    msg.sender,
+                    msg.text,
+                    1 if msg.mentioned_self else 0,
+                    ts,
+                    ts + ttl,
+                    ts,
+                ),
+            )
+            return msg.fingerprint
+
+    def list_pending(self, group_title: str, *, now: float | None = None) -> list[ExtractedMessage]:
+        """Expire stale items and return unexpired pending messages (@self prioritized, then FIFO)."""
+        ts = time.time() if now is None else float(now)
+        norm_group = canonicalize_chat_title(group_title)
+        with self._conn:
+            self._expire_pending_locked(norm_group, ts)
+        rows = self._conn.execute(
+            """
+            SELECT fingerprint, group_title, sender, text, mentioned_self, created_at
+            FROM pending_queue
+            WHERE group_title = ? AND status = 'pending'
+            ORDER BY mentioned_self DESC, id ASC
+            """,
+            (norm_group,),
+        ).fetchall()
+        return [
+            ExtractedMessage(
+                group_title=str(r["group_title"]),
+                role=MessageRole.INCOMING,
+                text=str(r["text"]),
+                sender=str(r["sender"]),
+                mentioned_self=bool(r["mentioned_self"]),
+                fingerprint=str(r["fingerprint"]),
+                captured_at=float(r["created_at"]),
+            )
+            for r in rows
+        ]
+
+    def has_pending(self, group_title: str, *, now: float | None = None) -> bool:
+        """Expire stale items and return True if any unexpired pending message remains."""
+        ts = time.time() if now is None else float(now)
+        norm_group = canonicalize_chat_title(group_title)
+        with self._conn:
+            self._expire_pending_locked(norm_group, ts)
+        row = self._conn.execute(
+            "SELECT 1 FROM pending_queue WHERE group_title = ? AND status = 'pending' LIMIT 1",
+            (norm_group,),
+        ).fetchone()
+        return row is not None
+
+    def mark_pending_status(
+        self,
+        fingerprint: str,
+        status: str,
+        *,
+        now: float | None = None,
+    ) -> None:
+        ts = time.time() if now is None else float(now)
+        with self._conn:
+            self._conn.execute(
+                "UPDATE pending_queue SET status = ?, updated_at = ? WHERE fingerprint = ?",
+                (status, ts, fingerprint),
+            )
 
     def append_audit(self, event: dict[str, Any]) -> None:
         if self.audit_log_path is None:

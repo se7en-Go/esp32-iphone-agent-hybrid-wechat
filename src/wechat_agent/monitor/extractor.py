@@ -126,6 +126,38 @@ def align_viewport_suffix(
     return ViewportAlignment("discontinuity", 0, len(curr))
 
 
+def merge_same_sender_bursts(
+    messages: Sequence[ExtractedMessage],
+    *,
+    max_gap_seconds: float = 5.0,
+) -> list[ExtractedMessage]:
+    """Merge adjacent INCOMING messages from the same non-empty sender within `max_gap_seconds`."""
+    merged: list[ExtractedMessage] = []
+    for msg in messages:
+        if not merged or msg.role != MessageRole.INCOMING or merged[-1].role != MessageRole.INCOMING:
+            merged.append(msg)
+            continue
+        prev = merged[-1]
+        prev_sender = normalize_text(prev.sender)
+        curr_sender = normalize_text(msg.sender)
+        gap = abs(float(msg.captured_at) - float(prev.captured_at))
+        if prev_sender and prev_sender == curr_sender and gap <= max_gap_seconds:
+            combined_text = f"{prev.text}\n{msg.text}" if prev.text and msg.text else (prev.text or msg.text)
+            merged[-1] = ExtractedMessage(
+                group_title=prev.group_title,
+                role=MessageRole.INCOMING,
+                text=combined_text,
+                sender=prev.sender,
+                box=msg.box or prev.box,
+                mentioned_self=prev.mentioned_self or msg.mentioned_self,
+                fingerprint=prev.fingerprint,
+                captured_at=max(float(prev.captured_at), float(msg.captured_at)),
+            )
+        else:
+            merged.append(msg)
+    return merged
+
+
 def _alias_ocr_pattern(alias: str) -> str:
     """Build regex for `alias`, tolerating sans-serif `I`/`l` OCR confusion."""
     return "".join("[Il]" if ch in ("I", "l") else re.escape(ch) for ch in alias)

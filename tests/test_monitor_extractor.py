@@ -9,6 +9,7 @@ from wechat_agent.monitor.extractor import (
     compute_event_fingerprint,
     compute_message_fingerprint,
     mentions_any_alias,
+    merge_same_sender_bursts,
     message_viewport_key,
     normalize_group_title,
 )
@@ -237,4 +238,25 @@ def test_extractor_ignores_sender_touching_white_sticker_and_filters_white_bg_st
     assert [(m.role, m.sender, m.text, m.mentioned_self) for m in msgs] == [
         (MessageRole.INCOMING, "测试群友B", "@示例助手 请问今天有活动吗", True),
         (MessageRole.SELF, "", "有的，下午三点开始", False),
+    ]
+
+
+def test_merge_same_sender_bursts_behavior() -> None:
+    g = "示例测试群"
+    m1 = ExtractedMessage(g, MessageRole.INCOMING, "请问营业时间", sender="测试群友A", mentioned_self=False, fingerprint="f1", captured_at=100.0)
+    m2 = ExtractedMessage(g, MessageRole.INCOMING, "@示例助手", sender="测试群友A", mentioned_self=True, fingerprint="f2", captured_at=103.0)
+    m3 = ExtractedMessage(g, MessageRole.INCOMING, "有人在吗", sender="测试群友B", mentioned_self=False, fingerprint="f3", captured_at=104.0)
+    # > 5s gap must NOT merge even for same sender
+    m4 = ExtractedMessage(g, MessageRole.INCOMING, "补充一句", sender="测试群友B", mentioned_self=False, fingerprint="f4", captured_at=112.0)
+    # Empty sender (hidden group nicknames) must NEVER merge across different users' bubbles
+    e1 = ExtractedMessage(g, MessageRole.INCOMING, "在吗", sender="", fingerprint="e1", captured_at=120.0)
+    e2 = ExtractedMessage(g, MessageRole.INCOMING, "价格多少", sender="", fingerprint="e2", captured_at=121.0)
+
+    out = merge_same_sender_bursts([m1, m2, m3, m4, e1, e2], max_gap_seconds=5.0)
+    assert [(x.sender, x.text, x.mentioned_self, x.fingerprint) for x in out] == [
+        ("测试群友A", "请问营业时间\n@示例助手", True, "f1"),
+        ("测试群友B", "有人在吗", False, "f3"),
+        ("测试群友B", "补充一句", False, "f4"),
+        ("", "在吗", False, "e1"),
+        ("", "价格多少", False, "e2"),
     ]

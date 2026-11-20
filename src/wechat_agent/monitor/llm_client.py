@@ -21,9 +21,9 @@ class LlmConfig:
     base_url: str = ""
     api_key: str = ""
     model: str = ""
-    timeout_seconds: float = 20.0
+    timeout_seconds: float = 30.0
     temperature: float = 0.2
-    max_tokens: int = 256
+    max_tokens: int = 2048
 
     @property
     def is_ready(self) -> bool:
@@ -49,9 +49,9 @@ class LlmConfig:
             base_url=base_url.strip(),
             api_key=api_key.strip(),
             model=model.strip(),
-            timeout_seconds=max(1.0, float(raw.get("timeout_seconds", 20.0))),
+            timeout_seconds=max(1.0, float(raw.get("timeout_seconds", 30.0))),
             temperature=float(raw.get("temperature", 0.2)),
-            max_tokens=max(32, int(raw.get("max_tokens", 256))),
+            max_tokens=max(32, int(raw.get("max_tokens", 2048))),
         )
 
 
@@ -118,10 +118,17 @@ class OpenAICompatibleLlmClient:
 
         try:
             data = json.loads(raw_bytes.decode("utf-8"))
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            finish_reason = choice.get("finish_reason")
+            content = choice["message"].get("content")
         except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
             raise LlmClientError(f"Invalid OpenAI-compatible response payload: {exc}") from exc
 
+        if finish_reason == "length" and (not isinstance(content, str) or not content.strip()):
+            raise LlmClientError(
+                f"LLM response truncated at finish_reason='length' with empty content "
+                f"(reasoning tokens likely exhausted max_tokens={payload['max_tokens']}; increase llm.max_tokens)"
+            )
         if not isinstance(content, str):
             raise LlmClientError("LLM response content must be a string")
         return content

@@ -53,8 +53,11 @@ class MonitorConfig:
     mention_min_confidence: float = 0.50
     mention_must_reply: bool = False
     context_window: int = 8
-    poll_interval_min_seconds: float = 8.0
-    poll_interval_max_seconds: float = 12.0
+    poll_interval_min_seconds: float = 2.0
+    poll_interval_max_seconds: float = 3.0
+    pending_ttl_seconds: float = 180.0
+    burst_merge_window_seconds: float = 5.0
+    short_discontinuity_window_seconds: float = 90.0
     cli_timeout_seconds: float = 90.0
     paste_flow_timeout_seconds: float = 180.0
     require_mounted_skill: bool = True
@@ -187,8 +190,11 @@ def load_monitor_config(
     )
 
     llm_cfg = LlmConfig.from_dict_and_env(data.get("llm") or {})
-    poll_min = max(1.0, float(data.get("poll_interval_min_seconds", 8.0)))
-    poll_max = max(poll_min, float(data.get("poll_interval_max_seconds", 12.0)))
+    poll_min = max(0.5, float(data.get("poll_interval_min_seconds", 2.0)))
+    poll_max = max(poll_min, float(data.get("poll_interval_max_seconds", 3.0)))
+    pending_ttl = max(10.0, float(data.get("pending_ttl_seconds", 180.0)))
+    burst_merge = max(0.0, float(data.get("burst_merge_window_seconds", 5.0)))
+    short_disc = max(0.0, float(data.get("short_discontinuity_window_seconds", 90.0)))
 
     return MonitorConfig(
         iphone_agent_cli=cli_path,
@@ -212,6 +218,9 @@ def load_monitor_config(
         context_window=max(1, int(data.get("context_window", 8))),
         poll_interval_min_seconds=poll_min,
         poll_interval_max_seconds=poll_max,
+        pending_ttl_seconds=pending_ttl,
+        burst_merge_window_seconds=burst_merge,
+        short_discontinuity_window_seconds=short_disc,
         cli_timeout_seconds=float(data.get("cli_timeout_seconds", 90.0)),
         paste_flow_timeout_seconds=float(data.get("paste_flow_timeout_seconds", 180.0)),
         require_mounted_skill=bool(data.get("require_mounted_skill", True)),

@@ -47,9 +47,12 @@ mention_min_confidence: 0.50
 mention_must_reply: false
 context_window: 8
 
-# Q4=A：轮询频率与双层频控默认值（只严不宽于底座与 wechat-group-reply/SKILL.md）
-poll_interval_min_seconds: 8.0
-poll_interval_max_seconds: 12.0
+# Q4=A + M2.5：高频只读观察（2–3s 抖动 + 静帧跳过 OCR），发言冷却/人工接管/静默窗保持严控
+poll_interval_min_seconds: 2.0
+poll_interval_max_seconds: 3.0
+pending_ttl_seconds: 180.0              # 待评估队列消息最长存活 3 分钟
+burst_merge_window_seconds: 5.0         # 同发信人 5s 内相邻消息自动合并
+short_discontinuity_window_seconds: 90.0  # 发送/切屏等短间隔刷屏断层恢复窗口
 quiet_hours: "23:00-07:00"
 rate_limits:
   global_min_interval_seconds: 15.0    # 底座下限 3s，本配置更严
@@ -59,15 +62,16 @@ rate_limits:
   human_takeover_cooldown_seconds: 600.0  # 检测到真人手动回复后静默 10 分钟
   max_reply_chars: 240
 
-# OpenAI 兼容 LLM 客户端（适配 DeepSeek 等；默认关闭，建议通过环境变量 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL 注入）
+# OpenAI 兼容 LLM 客户端（适配 DeepSeek 推理/对话模型；默认关闭，建议通过环境变量 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL 注入）
+# 注意：deepseek-flash 等推理模型会将思考 token 计入 max_tokens，默认值 2048 可避免思考耗尽输出空正文
 llm:
   enabled: false
   base_url: ""
   api_key: ""
   model: ""
-  timeout_seconds: 20.0
+  timeout_seconds: 30.0
   temperature: 0.2
-  max_tokens: 256
+  max_tokens: 2048
 
 # 私有状态库与审计日志（0700 目录 / 0600 文件）
 state_db_path: ".local-data/state/wechat_monitor.db"

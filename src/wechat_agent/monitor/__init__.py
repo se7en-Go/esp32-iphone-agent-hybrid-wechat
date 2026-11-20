@@ -9,6 +9,7 @@ from .extractor import (
     compute_event_fingerprint,
     compute_message_fingerprint,
     mentions_any_alias,
+    merge_same_sender_bursts,
     message_viewport_key,
     normalize_group_title,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "compute_message_fingerprint",
     "load_monitor_config",
     "mentions_any_alias",
+    "merge_same_sender_bursts",
     "message_viewport_key",
     "normalize_group_title",
 ]
