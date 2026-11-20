@@ -7,7 +7,11 @@ from tests.fakes import (
     make_keyboard_chat_image,
 )
 from wechat_agent.models import Box, OcrBox
-from wechat_agent.vision.geometry import is_in_home_indicator_zone, left_biased_input_aim
+from wechat_agent.vision.geometry import (
+    canonicalize_chat_title,
+    is_in_home_indicator_zone,
+    left_biased_input_aim,
+)
 from wechat_agent.vision.wechat_ui import (
     ScreenKind,
     detect_existing_draft,
@@ -16,6 +20,7 @@ from wechat_agent.vision.wechat_ui import (
     extract_outgoing_bubbles,
     find_chat_row_box,
     find_home_wechat_icon,
+    has_exact_chat_title,
     has_new_outgoing_bubble,
     locate_blue_send_button,
     locate_collapsed_input_box,
@@ -220,7 +225,7 @@ def test_extract_outgoing_bubbles_merges_multiline_wrapped_short_last_line_and_s
         OcrBox("文件传输助手", Box(0.35, 0.06, 0.65, 0.09)),
         OcrBox("iphoneagent自动操控iphone", Box(0.188, 0.182, 0.798, 0.206)),
         OcrBox("测试成功", Box(0.188, 0.208, 0.376, 0.231)),
-        OcrBox("画良策", Box(0.858, 0.185, 0.972, 0.203)),  # right avatar must be excluded
+        OcrBox("示例头像", Box(0.858, 0.185, 0.972, 0.203)),  # right avatar must be excluded
         OcrBox("第二条独立消息", Box(0.188, 0.276, 0.560, 0.300)),
     ]
 
@@ -230,5 +235,30 @@ def test_extract_outgoing_bubbles_merges_multiline_wrapped_short_last_line_and_s
         "第二条独立消息",
     ]
     assert has_new_outgoing_bubble([], bubbles, "iphone agent 自动操控iphone测试成功") is True
+
+
+def test_canonical_group_title_punctuation_and_parenthesized_suffix_matching() -> None:
+    assert canonicalize_chat_title("示例分享•测试3群（198）") == "示例分享·测试3群(198)"
+    assert canonicalize_chat_title("示例分享 ・ 测试3群 (198)") == "示例分享·测试3群(198)"
+
+    header_198_12 = [OcrBox("示例分享·测试3群（198）（12）", Box(0.147, 0.082, 0.750, 0.104))]
+    header_199_12 = [OcrBox("示例分享·测试3群（199）（12）", Box(0.147, 0.082, 0.750, 0.104))]
+    header_no_198 = [OcrBox("示例分享·测试3群（12）", Box(0.147, 0.082, 0.750, 0.104))]
+
+    target = "示例分享•测试3群（198）"
+    assert has_exact_chat_title(header_198_12, target, allow_group_count=True) is True
+    assert has_exact_chat_title(header_198_12, target, allow_group_count=False) is False
+    assert has_exact_chat_title(header_199_12, target, allow_group_count=True) is False
+    assert has_exact_chat_title(header_no_198, target, allow_group_count=True) is False
+
+    # Chat list row lookup normalizes middle-dots and fullwidth parens while keeping (198) != (199)
+    chat_rows = [
+        OcrBox("示例分享·测试3群（199）", Box(0.20, 0.20, 0.65, 0.23)),
+        OcrBox("示例分享·测试3群（198）", Box(0.20, 0.30, 0.65, 0.33)),
+        OcrBox("14:36", Box(0.87, 0.30, 0.96, 0.32)),
+    ]
+    row = find_chat_row_box(chat_rows, target)
+    assert row is not None
+    assert 0.28 <= row.center[1] <= 0.34
 
 

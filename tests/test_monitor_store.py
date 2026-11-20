@@ -131,26 +131,28 @@ def test_store_viewport_event_seq_recent_content_and_legacy_migration(tmp_path: 
         """
     )
     conn.execute(
-        "INSERT INTO group_state(group_title, baseline_seeded, last_seen_at) VALUES ('测试群', 1, 50.0)"
+        "INSERT INTO group_state(group_title, baseline_seeded, last_seen_at) VALUES ('示例分享·测试3群(198)', 1, 50.0)"
     )
     conn.commit()
     conn.close()
 
     with MonitorStore(db_path) as store:
-        assert store.is_baseline_seeded("测试群(8)") is True
-        assert store.get_last_viewport("测试群") == []
-        seq1 = store.next_event_seq("测试群")
-        seq2 = store.next_event_seq("测试群(9)")
-        assert (seq1, seq2) == (1, 2)
+        assert store.is_baseline_seeded("示例分享•测试3群（198）") is True
+        assert store.is_baseline_seeded("示例分享•测试3群（199）") is False
+        assert store.get_last_viewport("示例分享•测试3群（198）") == []
+        seq1 = store.next_event_seq("示例分享•测试3群（198）")
+        seq2 = store.next_event_seq("示例分享·测试3群(198)")
+        seq_other = store.next_event_seq("示例分享·测试3群(199)")
+        assert (seq1, seq2, seq_other) == (1, 2, 1)
 
         viewport = [
             ("incoming", "", "在吗"),
             ("self", "", "在的，请问"),
         ]
-        store.save_last_viewport("测试群", viewport, now=100.0)
+        store.save_last_viewport("示例分享•测试3群（198）", viewport, now=100.0)
         store.record_seen(
             ExtractedMessage(
-                group_title="测试群",
+                group_title="示例分享•测试3群（198）",
                 role=MessageRole.INCOMING,
                 sender="",
                 text="在吗",
@@ -159,19 +161,23 @@ def test_store_viewport_event_seq_recent_content_and_legacy_migration(tmp_path: 
             now=100.0,
         )
 
-    # Reopen store: migrated columns & viewport state survive process restart
+    # Reopen store: migrated columns & viewport state survive process restart and isolate (198) from (199)
     with MonitorStore(db_path) as store2:
-        assert store2.get_last_viewport("测试群") == [
+        assert store2.get_last_viewport("示例分享·测试3群(198)") == [
             ("incoming", "", "在吗"),
             ("self", "", "在的，请问"),
         ]
-        assert store2.next_event_seq("测试群") == 3
+        assert store2.get_last_viewport("示例分享·测试3群(199)") == []
+        assert store2.next_event_seq("示例分享·测试3群(198)") == 3
         assert store2.has_recent_message_content(
-            "测试群", MessageRole.INCOMING, "", "在 吗", since_ts=90.0
+            "示例分享•测试3群（198）", MessageRole.INCOMING, "", "在 吗", since_ts=90.0
         ) is False
         assert store2.has_recent_message_content(
-            "测试群", MessageRole.INCOMING, "", "在吗", since_ts=90.0
+            "示例分享•测试3群（198）", MessageRole.INCOMING, "", "在吗", since_ts=90.0
         ) is True
         assert store2.has_recent_message_content(
-            "测试群", MessageRole.INCOMING, "", "在吗", since_ts=105.0
+            "示例分享·测试3群(199)", MessageRole.INCOMING, "", "在吗", since_ts=90.0
+        ) is False
+        assert store2.has_recent_message_content(
+            "示例分享•测试3群（198）", MessageRole.INCOMING, "", "在吗", since_ts=105.0
         ) is False

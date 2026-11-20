@@ -12,6 +12,7 @@ from wechat_agent.config import WeChatSendConfig
 from wechat_agent.guards.rate_limit import MonitorRateLimiter
 from wechat_agent.guards.skill_guard import SkillGuard
 from wechat_agent.models import SendReport, SendStatus
+from wechat_agent.vision.geometry import canonicalize_chat_title
 from wechat_agent.vision.ocr import OcrEngine
 from wechat_agent.vision.wechat_ui import (
     ScreenKind,
@@ -31,7 +32,6 @@ from .extractor import (
     align_viewport_suffix,
     compute_event_fingerprint,
     message_viewport_key,
-    normalize_group_title,
 )
 from .generators.base import ReplyGenerator
 from .models import (
@@ -95,7 +95,7 @@ class MonitorRunner:
 
     def preflight(self) -> str | None:
         group_cfg = self.config.active_group
-        if group_cfg is None or not normalize_group_title(group_cfg.name):
+        if group_cfg is None or not canonicalize_chat_title(group_cfg.name):
             return "No target group configured in monitor target_groups"
 
         if self.config.mode == MonitorMode.LIVE:
@@ -152,7 +152,7 @@ class MonitorRunner:
                     message="No target group configured",
                 )
             )
-        group_name = normalize_group_title(group_cfg.name)
+        group_name = canonicalize_chat_title(group_cfg.name)
         now = self._clock()
 
         def tick_report(outcome: TickOutcome, message: str, **kwargs) -> TickReport:
@@ -505,7 +505,7 @@ class MonitorRunner:
 
         # 11. DRY_RUN red line: NEVER touch input box or paste drafts on real groups!
         is_sim_paste_allowed = (
-            group_name in {normalize_group_title(t) for t in self.config.simulation_targets}
+            group_name in {canonicalize_chat_title(t) for t in self.config.simulation_targets}
             and group_cfg.allow_dry_run_paste
         )
         if self.config.mode == MonitorMode.DRY_RUN and not is_sim_paste_allowed:
@@ -645,7 +645,7 @@ class MonitorRunner:
         reports: list[TickReport] = []
         preflight_err = self.preflight()
         if preflight_err is not None:
-            group_name = normalize_group_title(self.config.active_group.name) if self.config.active_group else ""
+            group_name = canonicalize_chat_title(self.config.active_group.name) if self.config.active_group else ""
             halted = self._finish_tick(
                 TickReport(
                     tick_index=0,

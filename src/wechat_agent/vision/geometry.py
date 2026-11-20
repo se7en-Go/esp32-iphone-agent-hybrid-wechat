@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 from wechat_agent.models import Box
@@ -10,11 +11,28 @@ from wechat_agent.models import Box
 HOME_INDICATOR_Y = 0.95
 HOME_INDICATOR_MAX_SAFE_Y = 0.948
 HOME_INDICATOR_X_RANGE = (0.32, 0.68)
+_MIDDLE_DOT_RE = re.compile(r"[•·・‧∙●◦]")
+_PUNCT_SPACE_RE = re.compile(r"\s*([·()])\s*")
 
 
 def normalize_text(text: str) -> str:
     """Normalize NFKC full/half-width characters and collapse outer whitespace."""
     return unicodedata.normalize("NFKC", text or "").strip()
+
+
+def canonicalize_chat_title(title: str) -> str:
+    """Canonicalize a WeChat chat/group title without stripping group-owned `(N)` suffixes.
+
+    - Converts fullwidth characters (such as `（198）`) via NFKC -> `(198)`
+    - Unifies middle-dot punctuation variants (`•`, `·`, `・`, `‧`, `∙`, `●`, `◦`) -> `·`
+    - Strips cosmetic whitespace around `·`, `(`, `)` and collapses repeated inner spaces
+    """
+    norm = normalize_text(title)
+    if not norm:
+        return ""
+    dotted = _MIDDLE_DOT_RE.sub("·", norm)
+    compact = _PUNCT_SPACE_RE.sub(r"\1", dotted)
+    return re.sub(r"\s+", " ", compact).strip()
 
 
 def is_in_home_indicator_zone(x: float, y: float) -> bool:

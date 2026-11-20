@@ -586,3 +586,53 @@ target_groups:
     assert "仅负责门店营业咨询；售后退款一律静默。" in llm.calls[1][1]["content"]
 
 
+def test_group_title_with_owned_number_matches_live_count_and_isolates_sibling_group(tmp_path: Path) -> None:
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    gate, gen = _rules_gate_and_gen()
+
+    f_198_12 = _group_frame(
+        ocr,
+        header="示例分享·测试3群（198）（12）",
+        incoming=[("测试群友A", "欢迎", Box(0.14, 0.25, 0.50, 0.31))],
+    )
+    f_198_12_new = _group_frame(
+        ocr,
+        header="示例分享·测试3群（198）（12）",
+        incoming=[
+            ("测试群友A", "欢迎", Box(0.14, 0.25, 0.50, 0.31)),
+            ("测试群友B", "营业时间几点", Box(0.14, 0.40, 0.56, 0.46)),
+        ],
+    )
+    f_199_12 = _group_frame(
+        ocr,
+        header="示例分享·测试3群（199）（12）",
+        incoming=[("测试群友A", "欢迎", Box(0.14, 0.26, 0.52, 0.32))],
+    )
+    driver.observe_queue = [
+        Observation("g0", f_198_12),
+        Observation("g1", f_198_12_new),
+        Observation("g2", f_199_12),
+    ]
+
+    cfg = _monitor_cfg(
+        tmp_path,
+        mode=MonitorMode.OBSERVE_ONLY,
+        group_name="示例分享•测试3群（198）",
+    )
+    with MonitorStore(cfg.state_db_path, cfg.audit_log_path) as store:
+        runner = MonitorRunner(driver, ocr, cfg, store, gate, gen, clock=lambda: 7000.0)
+        r0 = runner.run_tick(0)
+        assert r0.outcome == TickOutcome.BASELINE_SEEDED
+        assert r0.group_title == "示例分享·测试3群(198)"
+
+        r1 = runner.run_tick(1)
+        assert r1.outcome == TickOutcome.OBSERVED
+        assert r1.new_incoming_count == 1
+        assert r1.reply_text == "@测试群友B 白天9点到晚上8点都在"
+
+        # Sibling group (199) MUST be detected as having left target group (198)
+        r2 = runner.run_tick(2)
+        assert r2.outcome == TickOutcome.PAUSED_LEFT_GROUP
+
+

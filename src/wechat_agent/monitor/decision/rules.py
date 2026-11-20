@@ -9,9 +9,8 @@ from typing import Any
 
 import yaml
 
-from wechat_agent.monitor.extractor import normalize_group_title
 from wechat_agent.monitor.models import DecisionContext, DecisionResult
-from wechat_agent.vision.geometry import normalize_text
+from wechat_agent.vision.geometry import canonicalize_chat_title, normalize_text
 
 
 @dataclass(frozen=True)
@@ -32,8 +31,8 @@ class RuleSpec:
     def applies_to_group(self, group_title: str) -> bool:
         if not self.groups:
             return True
-        norm_target = normalize_group_title(group_title)
-        return any(normalize_group_title(g) == norm_target for g in self.groups)
+        norm_target = canonicalize_chat_title(group_title)
+        return any(canonicalize_chat_title(g) == norm_target for g in self.groups)
 
 
 def load_rules_yaml(path: str | Path) -> list[RuleSpec]:

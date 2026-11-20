@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 
 from wechat_agent.models import Box, OcrBox
-from wechat_agent.vision.geometry import normalize_text
+from wechat_agent.vision.geometry import canonicalize_chat_title, normalize_text
 from wechat_agent.vision.wechat_ui import has_continuous_green_bridge
 
 from .models import ExtractedMessage, MessageRole
@@ -46,8 +46,8 @@ _SYSTEM_MSG_RE = re.compile(
 
 
 def normalize_group_title(title: str) -> str:
-    """Normalize a WeChat group title, stripping trailing `(N)` member count."""
-    return _GROUP_COUNT_RE.sub("", normalize_text(title)).strip()
+    """Canonicalize a raw WeChat group header title, stripping one trailing `(N)` live member count."""
+    return _GROUP_COUNT_RE.sub("", canonicalize_chat_title(title)).strip()
 
 
 def _canonical_for_hash(text: str) -> str:
@@ -62,7 +62,7 @@ def compute_message_fingerprint(
     occurrence: int = 1,
 ) -> str:
     """Compute a deterministic cross-restart fingerprint for a visible message bubble."""
-    norm_group = normalize_group_title(group_title)
+    norm_group = canonicalize_chat_title(group_title)
     norm_sender = normalize_text(sender)
     canon_text = _canonical_for_hash(text)
     payload = f"{norm_group}\x1f{role.value}\x1f{norm_sender}\x1f{canon_text}\x1f{occurrence}"
@@ -82,7 +82,7 @@ def compute_event_fingerprint(
     text: str,
 ) -> str:
     """Compute an independent idempotency fingerprint for a newly arrived message event."""
-    norm_group = normalize_group_title(group_title)
+    norm_group = canonicalize_chat_title(group_title)
     norm_sender = normalize_text(sender)
     canon_text = _canonical_for_hash(text)
     payload = f"evt\x1f{norm_group}\x1f{int(event_seq)}\x1f{role.value}\x1f{norm_sender}\x1f{canon_text}"
@@ -126,8 +126,13 @@ def align_viewport_suffix(
     return ViewportAlignment("discontinuity", 0, len(curr))
 
 
+def _alias_ocr_pattern(alias: str) -> str:
+    """Build regex for `alias`, tolerating sans-serif `I`/`l` OCR confusion."""
+    return "".join("[Il]" if ch in ("I", "l") else re.escape(ch) for ch in alias)
+
+
 def mentions_any_alias(text: str, self_aliases: tuple[str, ...] | list[str]) -> bool:
-    """Return True if `text` contains `@alias` (supports ASCII `@`, fullwidth `＠`, and WeChat `\\u2005`)."""
+    """Return True if `text` contains `@alias` (supports `＠`, dropped `\\u2005`, and `I`/`l` OCR confusion)."""
     norm_text = normalize_text(text)
     if not norm_text or not self_aliases:
         return False
@@ -135,7 +140,11 @@ def mentions_any_alias(text: str, self_aliases: tuple[str, ...] | list[str]) -> 
         alias = normalize_text(raw_alias)
         if not alias:
             continue
-        pattern = re.compile(r"[@＠]" + re.escape(alias) + r"(?:$|[\s\u2005,，。!！?？:：;；、)])")
+        pattern = re.compile(
+            r"[@＠]"
+            + _alias_ocr_pattern(alias)
+            + r"(?:$|[\s\u2005,，。!！?？:：;；、)~～]|[\u4e00-\u9fff]|[A-Z][a-z])"
+        )
         if pattern.search(norm_text):
             return True
     return False
@@ -167,13 +176,13 @@ def _estimate_canvas_luminance(rgb: np.ndarray, bottom_limit: float) -> float:
 
 
 def _bubble_ratios(rgb: np.ndarray, box: Box, canvas_lum: float) -> tuple[float, float]:
-    """Return `(green_ratio, incoming_white_ratio)` inside a padded probe box."""
+    """Return `(green_ratio, incoming_white_ratio)` measured tightly within `box` (no vertical bleed)."""
     h, w, _ = rgb.shape
     probe = Box.clamped(
-        max(0.0, box.left - 0.015),
-        max(_VIEWPORT_TOP, box.top - 0.008),
-        min(1.0, box.right + 0.015),
-        min(1.0, box.bottom + 0.008),
+        max(0.0, box.left - 0.004),
+        max(_VIEWPORT_TOP, box.top),
+        min(1.0, box.right + 0.004),
+        min(1.0, box.bottom),
     )
     x0, y0, x1, y1 = _norm_box_to_pixels(probe, w, h)
     patch = rgb[y0:y1, x0:x1].astype(np.int16)
@@ -195,6 +204,86 @@ def _bubble_ratios(rgb: np.ndarray, box: Box, canvas_lum: float) -> tuple[float,
             & (~green_mask)
         )
     return green_ratio, float(white_mask.mean())
+
+
+def _has_white_above(rgb: np.ndarray, box: Box, canvas_lum: float) -> bool:
+    """Confirm the thin band immediately above `box.top` is also inside the white/raised bubble."""
+    h, w, _ = rgb.shape
+    strip = Box.clamped(
+        box.left,
+        max(_VIEWPORT_TOP, box.top - 0.005),
+        box.right,
+        box.top,
+    )
+    x0, y0, x1, y1 = _norm_box_to_pixels(strip, w, h)
+    if y1 <= y0:
+        return False
+    patch = rgb[y0:y1, x0:x1].astype(np.int16)
+    green_mask = (patch[:, :, 1] - patch[:, :, 0] >= 12) & (patch[:, :, 1] - patch[:, :, 2] >= 12)
+    if canvas_lum < 90.0:
+        above_mask = (patch.mean(axis=2) >= canvas_lum + 8.0) & (~green_mask)
+    else:
+        white_thresh = max(246, int(round(canvas_lum + 6)))
+        above_mask = (
+            (patch[:, :, 0] >= white_thresh)
+            & (patch[:, :, 1] >= white_thresh)
+            & (patch[:, :, 2] >= white_thresh)
+            & (~green_mask)
+        )
+    return float(above_mask.mean()) >= 0.40
+
+
+def _is_white_sticker_caption(
+    rgb: np.ndarray,
+    box: Box,
+    canvas_lum: float,
+    bottom_limit: float,
+) -> bool:
+    """Detect zero-margin or centered decorative captions inside white-background image stickers."""
+    if canvas_lum < 90.0:
+        return False
+    h, w, _ = rgb.shape
+    x0, y0, x1, y1 = _norm_box_to_pixels(box, w, h)
+    white_thresh = max(246, int(round(canvas_lum + 6)))
+
+    band = rgb[y0:y1, :, :].astype(np.int16)
+    if band.size == 0:
+        return False
+    col_white = (
+        (band[:, :, 0] >= white_thresh)
+        & (band[:, :, 1] >= white_thresh)
+        & (band[:, :, 2] >= white_thresh)
+    ).mean(axis=0)
+
+    run_left = x0
+    while run_left > 0 and col_white[run_left - 1] >= 0.45:
+        run_left -= 1
+    run_right = x1
+    while run_right < w and col_white[run_right] >= 0.45:
+        run_right += 1
+
+    pad_l = (x0 - run_left) / w
+    pad_r = (run_right - x1) / w
+    # Rule A: centered caption inside a wide white sticker card (real chat bubbles left-align text).
+    if pad_l >= 0.075 and pad_r >= 0.05:
+        return True
+
+    # Rule B: colorful illustration directly attached below the text inside the same card (no grey canvas gap).
+    if run_right <= run_left + 4:
+        return False
+    scan_end = min(int(round(bottom_limit * h)), y1 + int(round(0.14 * h)))
+    if scan_end <= y1:
+        return False
+    sub = rgb[y1:scan_end, run_left:run_right].astype(np.int16)
+    lum = sub.mean(axis=2)
+    sat = sub.max(axis=2) - sub.min(axis=2)
+    canvas_rows = ((np.abs(lum - canvas_lum) <= 6.0) & (sat <= 12)).mean(axis=1) >= 0.70
+    hit_canvas = np.where(canvas_rows)[0]
+    card_rows = int(hit_canvas[0]) if hit_canvas.size > 0 else sub.shape[0]
+    if card_rows < max(12, int(round(0.055 * h))):
+        return False
+    colorful_frac = float((sat[:card_rows] >= 28).mean())
+    return colorful_frac >= 0.14
 
 
 def _is_top_clipped_bubble(rgb: np.ndarray | None, box: Box, canvas_lum: float) -> bool:
@@ -240,7 +329,7 @@ class ChatMessageExtractor:
         captured_at: float | None = None,
     ) -> list[ExtractedMessage]:
         ts = time.time() if captured_at is None else float(captured_at)
-        norm_group = normalize_group_title(group_title)
+        norm_group = canonicalize_chat_title(group_title)
         rgb = _decode_rgb(image_bytes)
         canvas_lum = _estimate_canvas_luminance(rgb, bottom_limit) if rgb is not None else 237.0
 
@@ -267,8 +356,9 @@ class ChatMessageExtractor:
                 if 0.13 <= item.box.left <= 0.83 and green_r >= 0.15:
                     self_items.append(item)
                     continue
-                if item.box.left <= 0.56 and white_r >= 0.18:
-                    incoming_items.append(item)
+                if item.box.left <= 0.56 and white_r >= 0.30 and _has_white_above(rgb, item.box, canvas_lum):
+                    if not _is_white_sticker_caption(rgb, item.box, canvas_lum, bottom_limit):
+                        incoming_items.append(item)
                     continue
                 if not _SYSTEM_MSG_RE.match(text):
                     canvas_labels.append(item)

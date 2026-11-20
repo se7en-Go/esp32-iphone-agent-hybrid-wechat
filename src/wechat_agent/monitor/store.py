@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from wechat_agent.evidence import redact_dict
-from wechat_agent.vision.geometry import normalize_text
+from wechat_agent.vision.geometry import canonicalize_chat_title, normalize_text
 
-from .extractor import ViewportItem, _canonical_for_hash, normalize_group_title
+from .extractor import ViewportItem, _canonical_for_hash
 from .models import ContextTurn, ExtractedMessage, MessageRole
 
 
@@ -129,7 +129,7 @@ class MonitorStore:
         self.close()
 
     def _ensure_group_row(self, group_title: str) -> str:
-        norm = normalize_group_title(group_title)
+        norm = canonicalize_chat_title(group_title)
         self._conn.execute(
             "INSERT OR IGNORE INTO group_state(group_title) VALUES (?)",
             (norm,),
@@ -137,7 +137,7 @@ class MonitorStore:
         return norm
 
     def is_baseline_seeded(self, group_title: str) -> bool:
-        norm = normalize_group_title(group_title)
+        norm = canonicalize_chat_title(group_title)
         row = self._conn.execute(
             "SELECT baseline_seeded FROM group_state WHERE group_title = ?",
             (norm,),
@@ -155,7 +155,7 @@ class MonitorStore:
 
     def get_last_viewport(self, group_title: str) -> list[ViewportItem]:
         """Return the persisted ordered viewport tuple sequence from the previous tick."""
-        norm = normalize_group_title(group_title)
+        norm = canonicalize_chat_title(group_title)
         row = self._conn.execute(
             "SELECT last_viewport_json FROM group_state WHERE group_title = ?",
             (norm,),
@@ -214,7 +214,7 @@ class MonitorStore:
         since_ts: float,
     ) -> bool:
         """Check whether `(role, sender, text)` was recently recorded in `seen_messages`."""
-        norm_group = normalize_group_title(group_title)
+        norm_group = canonicalize_chat_title(group_title)
         norm_sender = normalize_text(sender)
         canon_text = _canonical_for_hash(text)
         rows = self._conn.execute(
@@ -246,7 +246,7 @@ class MonitorStore:
     ) -> bool:
         """Record a message fingerprint. Returns True if newly inserted, False if already seen."""
         ts = time.time() if now is None else float(now)
-        norm_group = normalize_group_title(msg.group_title)
+        norm_group = canonicalize_chat_title(msg.group_title)
         with self._conn:
             self._ensure_group_row(norm_group)
             cur = self._conn.execute(
@@ -282,7 +282,7 @@ class MonitorStore:
         """Return up to `limit` recent INCOMING/SELF turns in chronological order."""
         if limit <= 0:
             return []
-        norm_group = normalize_group_title(group_title)
+        norm_group = canonicalize_chat_title(group_title)
         rows = self._conn.execute(
             """
             SELECT role, sender, text, first_seen_at
@@ -332,7 +332,7 @@ class MonitorStore:
     ) -> bool:
         """Acquire a persistent per-fingerprint decision/send record (`INSERT OR IGNORE`)."""
         ts = time.time() if now is None else float(now)
-        norm_group = normalize_group_title(group_title)
+        norm_group = canonicalize_chat_title(group_title)
         with self._conn:
             cur = self._conn.execute(
                 """
@@ -383,7 +383,7 @@ class MonitorStore:
         canon = re.sub(r"\s+", "", normalize_text(text))
         if not canon:
             return False
-        norm_group = normalize_group_title(group_title)
+        norm_group = canonicalize_chat_title(group_title)
         rows = self._conn.execute(
             """
             SELECT id, reply_text FROM reply_history
@@ -405,7 +405,7 @@ class MonitorStore:
 
     def record_send_event(self, group_title: str, status: str, now: float | None = None) -> None:
         ts = time.time() if now is None else float(now)
-        norm_group = normalize_group_title(group_title)
+        norm_group = canonicalize_chat_title(group_title)
         with self._conn:
             self._ensure_group_row(norm_group)
             self._conn.execute(
@@ -424,7 +424,7 @@ class MonitorStore:
                 (float(since),),
             ).fetchall()
         else:
-            norm_group = normalize_group_title(group_title)
+            norm_group = canonicalize_chat_title(group_title)
             rows = self._conn.execute(
                 "SELECT sent_at FROM send_events WHERE sent_at >= ? AND group_title = ? ORDER BY sent_at ASC",
                 (float(since), norm_group),
@@ -440,7 +440,7 @@ class MonitorStore:
             )
 
     def get_takeover_until(self, group_title: str) -> float:
-        norm = normalize_group_title(group_title)
+        norm = canonicalize_chat_title(group_title)
         row = self._conn.execute(
             "SELECT takeover_until FROM group_state WHERE group_title = ?",
             (norm,),

@@ -15,6 +15,7 @@ from wechat_agent.models import Box, OcrBox
 
 from .geometry import (
     HOME_INDICATOR_MAX_SAFE_Y,
+    canonicalize_chat_title,
     clamp_avoiding_home_indicator,
     derive_home_icon_body_box,
     normalize_text,
@@ -104,11 +105,11 @@ def has_exact_chat_title(
     allow_group_count: bool = False,
 ) -> bool:
     """Return True if the top navigation header uniquely shows `target_title`."""
-    target_norm = normalize_text(target_title)
-    if not target_norm:
+    target_canon = canonicalize_chat_title(target_title)
+    if not target_canon:
         return False
     group_pattern = (
-        re.compile(re.escape(target_norm) + r"\s*\(\d+\)")
+        re.compile(re.escape(target_canon) + r"\(\d+\)")
         if allow_group_count
         else None
     )
@@ -118,10 +119,10 @@ def has_exact_chat_title(
         cx = item.box.center[0]
         if not (0.14 <= cx <= 0.86):
             continue
-        item_norm = normalize_text(item.text)
-        if item_norm == target_norm:
+        item_canon = canonicalize_chat_title(item.text)
+        if item_canon == target_canon:
             return True
-        if group_pattern is not None and group_pattern.fullmatch(item_norm):
+        if group_pattern is not None and group_pattern.fullmatch(item_canon):
             return True
     return False
 
@@ -263,13 +264,13 @@ def find_chat_row_box(ocr_boxes: list[OcrBox], target_title: str) -> Box | None:
     Avoids both the black title characters on the left and the far-right timestamp text so the grey
     AssistiveTouch pointer dot stays clearly detectable during `point` and `observe --for-click`.
     """
-    target_norm = normalize_text(target_title)
-    if not target_norm:
+    target_canon = canonicalize_chat_title(target_title)
+    if not target_canon:
         return None
     for item in ocr_boxes:
         if item.box.top < 0.12 or item.box.bottom > 0.88:
             continue
-        if normalize_text(item.text) == target_norm:
+        if canonicalize_chat_title(item.text) == target_canon:
             cy = item.box.center[1]
             right_items = [
                 other
