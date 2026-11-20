@@ -143,3 +143,22 @@ def test_align_viewport_suffix_and_event_fingerprints() -> None:
     ep3 = compute_event_fingerprint("测试群(5)", 2, MessageRole.INCOMING, "", "在吗")
     assert ep1 == ep2
     assert ep1 != ep3
+
+
+def test_extractor_merges_multiline_wrapped_self_green_bubble() -> None:
+    b1 = Box(0.16, 0.170, 0.83, 0.245)
+    b2 = Box(0.16, 0.268, 0.83, 0.312)
+    img = make_collapsed_chat_image(outgoing_boxes=[b1, b2])
+    ocr = [
+        OcrBox("产品讨论群(18)", Box(0.32, 0.06, 0.68, 0.09)),
+        OcrBox("iphoneagent自动操控iphone", Box(0.188, 0.182, 0.798, 0.206)),
+        OcrBox("测试成功", Box(0.188, 0.208, 0.376, 0.231)),
+        OcrBox("画良策", Box(0.858, 0.185, 0.972, 0.203)),
+        OcrBox("另一条单独回复", Box(0.188, 0.276, 0.560, 0.300)),
+    ]
+    msgs = ChatMessageExtractor().extract(img, ocr, group_title="产品讨论群(18)")
+    assert [m.role for m in msgs] == [MessageRole.SELF, MessageRole.SELF]
+    assert [m.text for m in msgs] == [
+        "iphoneagent自动操控iphone\n测试成功",
+        "另一条单独回复",
+    ]

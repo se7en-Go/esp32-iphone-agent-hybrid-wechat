@@ -518,3 +518,115 @@ def test_focus_input_recovers_on_pre_click_409_and_passive_keyboard_settle(
     # Focus click ran ONCE (never double-clicked)
     assert len([c for c in driver.calls if c[0] == "click_observed"]) == 1
 
+
+def _make_chat_list_frame(ocr: MockOcrEngine, header: str, suffix: bytes) -> bytes:
+    img = make_chat_list_image() + suffix
+    ocr.register(
+        img,
+        [
+            OcrBox(header, Box(0.36, 0.05, 0.64, 0.085)),
+            OcrBox("文件传输助手", Box(0.20, 0.24, 0.48, 0.27)),
+            OcrBox("13:44", Box(0.87, 0.24, 0.96, 0.265)),
+            OcrBox("微信", Box(0.08, 0.90, 0.16, 0.925)),
+            OcrBox("通讯录", Box(0.32, 0.90, 0.42, 0.925)),
+        ],
+    )
+    return img
+
+
+def test_navigation_waits_for_chat_list_sync_header_before_clicking(tmp_path: Path) -> None:
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    frames = _register_happy_chat_flow(driver, ocr, message_text="等同步完成再点击")
+
+    sync_1 = _make_chat_list_frame(ocr, "收取中...", b"sync1")
+    sync_2 = _make_chat_list_frame(ocr, "Connecting...", b"sync2")
+    ready_list = _make_chat_list_frame(ocr, "微信", b"ready")
+
+    driver.observe_queue = [
+        Observation(screen_id="scr-sync-1", image_bytes=sync_1),
+        Observation(screen_id="scr-sync-2", image_bytes=sync_2),
+        Observation(screen_id="scr-list-ready", image_bytes=ready_list),
+        Observation(screen_id="scr-pasted", image_bytes=frames["pasted"]),
+    ]
+
+    seen_point_sids: list[str] = []
+
+    def handle_point(x, y, sid, tb, rh):
+        seen_point_sids.append(sid)
+        return PointResult(screen_id=f"{sid}-pt", measured_pointer=MeasuredPointer(x, y), pointer_seen=True)
+
+    driver.point_handler = handle_point
+    click_seq = [
+        ClickResult(screen_id="scr-chat", clicked=True, command_acknowledged=True, image_bytes=frames["collapsed"]),
+        ClickResult(screen_id="scr-kb", clicked=True, command_acknowledged=True, image_bytes=frames["focused_empty"]),
+    ]
+    driver.click_handler = lambda *args: click_seq.pop(0)
+
+    sleeps: list[float] = []
+    rep = SendMessageWorkflow(driver, ocr, _config(tmp_path), sleeper=sleeps.append).run(
+        "文件传输助手", "等同步完成再点击", send=False
+    )
+    assert rep.status == SendStatus.DRY_RUN_READY
+    assert sleeps == [1.2, 1.2]
+    # First point in chat list only happened AFTER header settled to "微信" (`scr-list-ready`)
+    assert seen_point_sids[0] == "scr-list-ready"
+
+
+def test_navigation_409_progressive_backoff_recovers_and_caps(tmp_path: Path) -> None:
+    # Part A: 3 consecutive HTTP 409 responses recover on the 4th attempt using progressive backoff
+    driver_ok = FakePhoneDriver()
+    ocr_ok = MockOcrEngine()
+    frames_ok = _register_happy_chat_flow(driver_ok, ocr_ok, message_text="409退避恢复")
+    ready_list = _make_chat_list_frame(ocr_ok, "微信", b"ready-a")
+
+    driver_ok.observe_queue = [
+        Observation(screen_id="scr-l0", image_bytes=ready_list),
+        Observation(screen_id="scr-l1", image_bytes=ready_list),
+        Observation(screen_id="scr-l2", image_bytes=ready_list),
+        Observation(screen_id="scr-l3", image_bytes=ready_list),
+        Observation(screen_id="scr-pasted", image_bytes=frames_ok["pasted"]),
+    ]
+    attempts_ok = {"n": 0}
+
+    def handle_point_ok(x, y, sid, tb, rh):
+        attempts_ok["n"] += 1
+        if attempts_ok["n"] <= 3:
+            raise ConflictError("HTTP 409: screen changed since observation; observe again", status_code=409)
+        return PointResult(screen_id=f"{sid}-pt", measured_pointer=MeasuredPointer(x, y), pointer_seen=True)
+
+    driver_ok.point_handler = handle_point_ok
+    click_seq_ok = [
+        ClickResult(screen_id="scr-chat", clicked=True, command_acknowledged=True, image_bytes=frames_ok["collapsed"]),
+        ClickResult(screen_id="scr-kb", clicked=True, command_acknowledged=True, image_bytes=frames_ok["focused_empty"]),
+    ]
+    driver_ok.click_handler = lambda *args: click_seq_ok.pop(0)
+
+    sleeps_ok: list[float] = []
+    rep_ok = SendMessageWorkflow(driver_ok, ocr_ok, _config(tmp_path), sleeper=sleeps_ok.append).run(
+        "文件传输助手", "409退避恢复", send=False
+    )
+    assert rep_ok.status == SendStatus.DRY_RUN_READY
+    assert sleeps_ok == [0.8, 1.5, 2.2]
+
+    # Part B: 6 consecutive HTTP 409 responses exhaust all 5 retries with full progressive backoff and abort cleanly
+    driver_fail = FakePhoneDriver()
+    ocr_fail = MockOcrEngine()
+    ready_list_b = _make_chat_list_frame(ocr_fail, "微信", b"ready-b")
+    driver_fail.observe_queue = [
+        Observation(screen_id=f"scr-f{i}", image_bytes=ready_list_b) for i in range(6)
+    ]
+
+    def handle_point_fail(x, y, sid, tb, rh):
+        raise ConflictError("HTTP 409: screen changed since observation; observe again", status_code=409)
+
+    driver_fail.point_handler = handle_point_fail
+    sleeps_fail: list[float] = []
+    rep_fail = SendMessageWorkflow(driver_fail, ocr_fail, _config(tmp_path), sleeper=sleeps_fail.append).run(
+        "文件传输助手", "409耗尽中止", send=False
+    )
+    assert rep_fail.status == SendStatus.ABORTED_NAVIGATION
+    assert "exceeded 5 pre-click 409" in rep_fail.message
+    assert sleeps_fail == [0.8, 1.5, 2.2, 2.5, 3.0]
+    assert not any(c[0] == "click_observed" for c in driver_fail.calls)
+

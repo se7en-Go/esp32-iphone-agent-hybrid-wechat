@@ -659,6 +659,24 @@ def _is_green_bubble_box(rgb: np.ndarray, box: Box) -> bool:
     return float(green_mask.mean()) >= 0.15
 
 
+def has_continuous_green_bridge(rgb: np.ndarray, top_box: Box, bottom_box: Box) -> bool:
+    """Verify vertical inter-line gap stays inside the same green bubble (no grey canvas gap)."""
+    if bottom_box.top - top_box.bottom <= 0.003:
+        return True
+    h, w, _ = rgb.shape
+    x_left = max(top_box.left, bottom_box.left)
+    x_right = min(top_box.right, bottom_box.right)
+    if x_right - x_left < 0.01:
+        x_left, x_right = bottom_box.left, bottom_box.right
+    strip = Box.clamped(x_left, top_box.bottom, x_right, bottom_box.top)
+    x0, y0, x1, y1 = _norm_box_to_pixels(strip, w, h)
+    if y1 <= y0:
+        return True
+    patch = rgb[y0:y1, x0:x1].astype(np.int16)
+    green_mask = (patch[:, :, 1] - patch[:, :, 0] >= 12) & (patch[:, :, 1] - patch[:, :, 2] >= 12)
+    return float(green_mask.mean(axis=1).min()) >= 0.20
+
+
 def extract_outgoing_bubbles(
     image_bytes: bytes,
     ocr_boxes: list[OcrBox],
@@ -674,14 +692,15 @@ def extract_outgoing_bubbles(
             continue
         if not normalize_text(item.text):
             continue
-        # Outgoing bubbles sit toward the right side of the chat area.
-        if item.box.right < 0.42:
-            continue
         if rgb is not None:
+            # Exclude far-left/right avatar columns while keeping short wrapped tail lines inside wide green bubbles.
+            if not (0.13 <= item.box.left <= 0.83):
+                continue
             if not _is_green_bubble_box(rgb, item.box):
                 continue
-        elif item.box.center[0] < 0.50:
-            continue
+        else:
+            if item.box.right < 0.42 or item.box.center[0] < 0.50:
+                continue
         candidates.append(item)
 
     if not candidates:
@@ -691,7 +710,12 @@ def extract_outgoing_bubbles(
     grouped: list[list[OcrBox]] = [[candidates[0]]]
     for item in candidates[1:]:
         prev = grouped[-1][-1]
-        if (item.box.top - prev.box.bottom) <= 0.032 and abs(item.box.right - prev.box.right) <= 0.25:
+        vgap = item.box.top - prev.box.bottom
+        aligned = abs(item.box.left - prev.box.left) <= 0.12 or abs(item.box.right - prev.box.right) <= 0.25
+        same_bubble = -0.005 <= vgap <= 0.032 and aligned
+        if same_bubble and rgb is not None:
+            same_bubble = has_continuous_green_bridge(rgb, prev.box, item.box)
+        if same_bubble:
             grouped[-1].append(item)
         else:
             grouped.append([item])

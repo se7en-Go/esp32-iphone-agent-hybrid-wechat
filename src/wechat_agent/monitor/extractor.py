@@ -15,6 +15,7 @@ from PIL import Image
 
 from wechat_agent.models import Box, OcrBox
 from wechat_agent.vision.geometry import normalize_text
+from wechat_agent.vision.wechat_ui import has_continuous_green_bridge
 
 from .models import ExtractedMessage, MessageRole
 
@@ -263,7 +264,7 @@ class ChatMessageExtractor:
 
             if rgb is not None:
                 green_r, white_r = _bubble_ratios(rgb, item.box, canvas_lum)
-                if item.box.right >= 0.42 and green_r >= 0.15:
+                if 0.13 <= item.box.left <= 0.83 and green_r >= 0.15:
                     self_items.append(item)
                     continue
                 if item.box.left <= 0.56 and white_r >= 0.18:
@@ -298,10 +299,14 @@ class ChatMessageExtractor:
                 prev = groups[-1][-1]
                 vgap = item.box.top - prev.box.bottom
                 if role == MessageRole.SELF:
-                    aligned = abs(item.box.right - prev.box.right) <= 0.12
+                    aligned = abs(item.box.left - prev.box.left) <= 0.09 or abs(item.box.right - prev.box.right) <= 0.12
+                    same_group = -0.005 <= vgap <= 0.032 and aligned
+                    if same_group and rgb is not None:
+                        same_group = has_continuous_green_bridge(rgb, prev.box, item.box)
                 else:
                     aligned = abs(item.box.left - prev.box.left) <= 0.09
-                if -0.005 <= vgap <= 0.032 and aligned:
+                    same_group = -0.005 <= vgap <= 0.032 and aligned
+                if same_group:
                     groups[-1].append(item)
                 else:
                     groups.append([item])

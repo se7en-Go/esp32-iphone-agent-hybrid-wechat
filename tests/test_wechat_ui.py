@@ -208,3 +208,27 @@ def test_empty_white_input_box_with_right_mic_and_toolbar_icons_not_truncated() 
     assert col_box.bottom <= 0.948
 
 
+def test_extract_outgoing_bubbles_merges_multiline_wrapped_short_last_line_and_splits_separate_bubbles() -> None:
+    # Bubble 1: wide 2-line wrapped green bubble where line 2 ("测试成功") ends at right=0.376 (< 0.42),
+    # left-aligned at 0.188 inside the single continuous green bubble [0.16..0.83, 0.17..0.245].
+    # Bubble 2: separate green bubble stacked closely below with grey canvas gap between 0.245 and 0.268.
+    b1 = Box(0.16, 0.170, 0.83, 0.245)
+    b2 = Box(0.16, 0.268, 0.83, 0.312)
+    img = make_collapsed_chat_image(outgoing_boxes=[b1, b2])
+
+    ocr = [
+        OcrBox("文件传输助手", Box(0.35, 0.06, 0.65, 0.09)),
+        OcrBox("iphoneagent自动操控iphone", Box(0.188, 0.182, 0.798, 0.206)),
+        OcrBox("测试成功", Box(0.188, 0.208, 0.376, 0.231)),
+        OcrBox("画良策", Box(0.858, 0.185, 0.972, 0.203)),  # right avatar must be excluded
+        OcrBox("第二条独立消息", Box(0.188, 0.276, 0.560, 0.300)),
+    ]
+
+    bubbles = extract_outgoing_bubbles(img, ocr, chat_area=Box(0.0, 0.13, 1.0, 0.87))
+    assert bubbles == [
+        "iphoneagent自动操控iphone\n测试成功",
+        "第二条独立消息",
+    ]
+    assert has_new_outgoing_bubble([], bubbles, "iphone agent 自动操控iphone测试成功") is True
+
+

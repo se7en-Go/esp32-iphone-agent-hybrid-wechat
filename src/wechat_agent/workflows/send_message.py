@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 from wechat_agent.adapters.driver import DriverError, PhoneDriver
 from wechat_agent.config import WeChatSendConfig
@@ -39,10 +40,13 @@ class SendMessageWorkflow:
         driver: PhoneDriver,
         ocr: OcrEngine,
         config: WeChatSendConfig,
+        *,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.driver = driver
         self.ocr = ocr
         self.config = config
+        self._sleeper = sleeper
         self.target_policy = TargetPolicy(config.allowed_targets)
         self.skill_guard = SkillGuard(driver, skill_name=config.skill_name)
 
@@ -133,6 +137,7 @@ class SendMessageWorkflow:
             click_chain,
             evidence,
             allow_group_count=self.config.allow_group_count,
+            sleeper=self._sleeper,
         )
 
         # 3. Initial observe + risk phrase check

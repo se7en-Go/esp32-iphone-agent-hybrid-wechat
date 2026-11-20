@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 from wechat_agent.adapters.driver import PhoneDriver
 from wechat_agent.evidence import RunEvidence
 from wechat_agent.models import Box, ClickResult, Observation, OcrBox
+from wechat_agent.vision.geometry import normalize_text
 from wechat_agent.vision.ocr import OcrEngine
 from wechat_agent.vision.wechat_ui import (
     ScreenKind,
@@ -18,6 +20,23 @@ from wechat_agent.vision.wechat_ui import (
 )
 
 from .click_chain import ClickChain, PointerConflictError
+
+_SYNC_HEADER_TOKENS = ("收取中", "连接中", "receiving", "connecting")
+DEFAULT_SYNC_POLL_INTERVAL = 1.2
+DEFAULT_MAX_SYNC_WAIT_ATTEMPTS = 12
+DEFAULT_CONFLICT_BACKOFF_SECONDS: tuple[float, ...] = (0.8, 1.5, 2.2, 2.5, 3.0)
+
+
+def find_chat_list_sync_label(ocr_boxes: list[OcrBox]) -> str | None:
+    """Return the normalized WeChat sync/connecting header label if the chat list is still syncing."""
+    for item in ocr_boxes:
+        if not (0.03 <= item.box.top and item.box.bottom <= 0.14 and 0.14 <= item.box.center[0] <= 0.86):
+            continue
+        norm = normalize_text(item.text)
+        lowered = norm.lower()
+        if any(tok in lowered for tok in _SYNC_HEADER_TOKENS):
+            return norm
+    return None
 
 
 class NavigationError(RuntimeError):
@@ -33,12 +52,28 @@ class WeChatNavigator:
         evidence: RunEvidence,
         *,
         allow_group_count: bool = False,
+        sleeper: Callable[[float], None] | None = None,
+        sync_poll_interval: float = DEFAULT_SYNC_POLL_INTERVAL,
+        max_sync_wait_attempts: int = DEFAULT_MAX_SYNC_WAIT_ATTEMPTS,
+        conflict_backoff_seconds: tuple[float, ...] = DEFAULT_CONFLICT_BACKOFF_SECONDS,
     ) -> None:
         self.driver = driver
         self.ocr = ocr
         self.click_chain = click_chain
         self.evidence = evidence
         self.allow_group_count = allow_group_count
+        self._sleeper = sleeper
+        self.sync_poll_interval = float(sync_poll_interval)
+        self.max_sync_wait_attempts = max(0, int(max_sync_wait_attempts))
+        self.conflict_backoff_seconds = tuple(float(s) for s in conflict_backoff_seconds)
+
+    def _sleep(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        if self._sleeper is not None:
+            self._sleeper(seconds)
+        else:
+            time.sleep(seconds)
 
     def _next_observation(self, click_res: ClickResult, step_name: str) -> Observation:
         if click_res.screen_id and click_res.image_bytes:
@@ -61,9 +96,10 @@ class WeChatNavigator:
         scroll_attempts = 0
         back_attempts = 0
         conflict_retries = 0
-        max_conflict_retries = 3
+        max_conflict_retries = len(self.conflict_backoff_seconds)
+        max_steps = max(12, 7 + max_conflict_retries)
 
-        for step in range(9):
+        for step in range(max_steps):
             kind = detect_screen_context(
                 ocr_boxes,
                 target_title,
@@ -129,6 +165,45 @@ class WeChatNavigator:
                     continue
 
                 if kind == ScreenKind.WECHAT_CHAT_LIST:
+                    sync_waits = 0
+                    left_chat_list = False
+                    while sync_waits < self.max_sync_wait_attempts:
+                        sync_label = find_chat_list_sync_label(ocr_boxes)
+                        if sync_label is None:
+                            break
+                        sync_waits += 1
+                        self.evidence.log_event(
+                            "nav_chat_list_sync_wait",
+                            {
+                                "step": step,
+                                "attempt": sync_waits,
+                                "header": sync_label,
+                                "sleep_seconds": self.sync_poll_interval,
+                            },
+                        )
+                        self._sleep(self.sync_poll_interval)
+                        obs = self.driver.observe(
+                            image_output=self.evidence.image_output_path(f"nav_sync_wait_{step}_{sync_waits}")
+                        )
+                        ocr_boxes = self.ocr.read_boxes(obs.image_bytes)
+                        recheck_kind = detect_screen_context(
+                            ocr_boxes,
+                            target_title,
+                            allow_group_count=self.allow_group_count,
+                        )
+                        if recheck_kind != ScreenKind.WECHAT_CHAT_LIST:
+                            left_chat_list = True
+                            break
+
+                    if left_chat_list:
+                        continue
+                    remaining_sync = find_chat_list_sync_label(ocr_boxes)
+                    if remaining_sync is not None:
+                        self.evidence.log_event(
+                            "nav_chat_list_sync_timeout",
+                            {"step": step, "attempts": sync_waits, "header": remaining_sync},
+                        )
+
                     row_box = find_chat_row_box(ocr_boxes, target_title)
                     if row_box is not None:
                         click_res = self.click_chain.point_and_click(
@@ -170,15 +245,25 @@ class WeChatNavigator:
                 raise NavigationError(f"Cannot navigate to {target_title!r} from screen state {kind.value}")
             except PointerConflictError as exc:
                 conflict_retries += 1
-                self.evidence.log_event(
-                    "nav_pre_click_409_reobserve",
-                    {"step": step, "retry": conflict_retries, "detail": exc.detail},
-                )
                 if conflict_retries > max_conflict_retries:
+                    self.evidence.log_event(
+                        "nav_pre_click_409_reobserve",
+                        {"step": step, "retry": conflict_retries, "detail": exc.detail},
+                    )
                     raise NavigationError(
                         f"Navigation exceeded {max_conflict_retries} pre-click 409 re-observations: {exc}"
                     ) from exc
-                time.sleep(0.25)
+                delay = self.conflict_backoff_seconds[conflict_retries - 1]
+                self.evidence.log_event(
+                    "nav_pre_click_409_reobserve",
+                    {
+                        "step": step,
+                        "retry": conflict_retries,
+                        "sleep_seconds": delay,
+                        "detail": exc.detail,
+                    },
+                )
+                self._sleep(delay)
                 obs = self.driver.observe(
                     image_output=self.evidence.image_output_path(f"nav_reobs_409_{step}")
                 )
