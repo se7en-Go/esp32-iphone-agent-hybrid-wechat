@@ -303,3 +303,41 @@ def test_verify_pasted_text_4line_draft_strictly_excludes_adjacent_chat_bubbles_
     assert ok_dup is False
 
 
+def test_verify_pasted_text_enforces_hard_newline_structure() -> None:
+    pill = Box(0.132, 0.456, 0.764, 0.576)
+
+    # Hard newline lost (merged onto a single visual row) -> MUST fail
+    merged_single_row = [OcrBox("第一行第二行", Box(0.16, 0.48, 0.55, 0.505))]
+    ok_merged, _ = verify_pasted_text(merged_single_row, pill, "第一行\n第二行")
+    assert ok_merged is False
+
+    # Hard newline shifted across visual rows -> MUST fail
+    shifted_rows = [
+        OcrBox("第一行第二行", Box(0.16, 0.47, 0.58, 0.495)),
+        OcrBox("很长补充内容", Box(0.16, 0.505, 0.58, 0.530)),
+    ]
+    ok_shifted, _ = verify_pasted_text(shifted_rows, pill, "第一行\n第二行很长补充内容")
+    assert ok_shifted is False
+
+    # Hard newline preserved across two distinct visual rows -> MUST pass
+    preserved_rows = [
+        OcrBox("第一行", Box(0.16, 0.47, 0.36, 0.495)),
+        OcrBox("第二行", Box(0.16, 0.505, 0.36, 0.530)),
+    ]
+    ok_preserved, _ = verify_pasted_text(preserved_rows, pill, "第一行\n第二行")
+    assert ok_preserved is True
+
+    # Logical line 1 soft-wraps across 2 visual rows + hard newline starts row 3 -> MUST pass
+    soft_wrapped_with_newline = [
+        OcrBox("这是一段需要自动换", Box(0.16, 0.468, 0.70, 0.490)),
+        OcrBox("行的第一行", Box(0.16, 0.498, 0.45, 0.520)),
+        OcrBox("第二行总结", Box(0.16, 0.528, 0.45, 0.550)),
+    ]
+    ok_soft, _ = verify_pasted_text(
+        soft_wrapped_with_newline,
+        pill,
+        "这是一段需要自动换行的第一行\n第二行总结",
+    )
+    assert ok_soft is True
+
+

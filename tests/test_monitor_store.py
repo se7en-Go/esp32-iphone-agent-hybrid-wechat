@@ -164,8 +164,8 @@ def test_store_viewport_event_seq_recent_content_and_legacy_migration(tmp_path: 
     # Reopen store: migrated columns & viewport state survive process restart and isolate (198) from (199)
     with MonitorStore(db_path) as store2:
         assert store2.get_last_viewport("示例分享·测试3群(198)") == [
-            ("incoming", "", "在吗"),
-            ("self", "", "在的，请问"),
+            ("incoming", "", "在吗", 1),
+            ("self", "", "在的，请问", 1),
         ]
         assert store2.get_last_viewport("示例分享·测试3群(199)") == []
         assert store2.next_event_seq("示例分享·测试3群(198)") == 3
@@ -244,8 +244,8 @@ def test_store_single_instance_flock_and_atomic_batch_rollback(tmp_path: Path) -
         assert len(merged) == 1
         assert merged[0].text == "请问价格\n@示例助手"
         assert store1.get_last_viewport(g) == [
-            ("incoming", "测试群友A", "请问价格"),
-            ("incoming", "测试群友A", "@示例助手"),
+            ("incoming", "测试群友A", "请问价格", 1),
+            ("incoming", "测试群友A", "@示例助手", 1),
         ]
         assert len(store1.list_pending(g, now=105.0)) == 1
 
@@ -351,4 +351,45 @@ target_groups:
     omitted.write_text('target_groups:\n  - name: "示例群A"\n', encoding="utf-8")
     cfg_def = load_monitor_config(omitted)
     assert cfg_def.rate_limits.forbidden_reply_patterns == DEFAULT_FORBIDDEN_PATTERNS
+
+
+def test_claim_bot_reply_match_tightened_prevents_short_substring_takeover_bypass(tmp_path: Path) -> None:
+    db_path = tmp_path / "state" / "claim.db"
+    g = "示例测试群"
+    with MonitorStore(db_path) as store:
+        # 1. Short bot reply "好的" must NOT be swallowed by a longer human message containing "好的"
+        store.record_reply_decision(
+            fingerprint="bot-short-1",
+            group_title=g,
+            mode="live",
+            status="sent_confirmed",
+            reply_text="好的",
+            now=100.0,
+        )
+        assert store.claim_bot_reply_match(g, "好的，我现在马上处理您的订单", since_ts=50.0) is False
+        # Exact bot echo still matches cleanly and consumes the record
+        assert store.claim_bot_reply_match(g, "好的", since_ts=50.0) is True
+        # Consumed record cannot be claimed a second time
+        assert store.claim_bot_reply_match(g, "好的", since_ts=50.0) is False
+
+        # 2. Long bot reply (>= 10 canonical chars) tolerates minor OCR edge truncation (>= 85% length ratio)
+        store.record_reply_decision(
+            fingerprint="bot-long-1",
+            group_title=g,
+            mode="live",
+            status="sent_confirmed",
+            reply_text="请按群内官方团购链接下单即可哦",
+            now=200.0,
+        )
+        # Much longer human message containing the bot reply (ratio < 0.85) must NOT claim it
+        assert (
+            store.claim_bot_reply_match(
+                g,
+                "补充一下，请按群内官方团购链接下单即可哦，有任何问题随时私信群主确认",
+                since_ts=150.0,
+            )
+            is False
+        )
+        # Single-char OCR truncation (14/15 = 93.3% >= 85%) DOES match
+        assert store.claim_bot_reply_match(g, "请按群内官方团购链接下单即可", since_ts=150.0) is True
 

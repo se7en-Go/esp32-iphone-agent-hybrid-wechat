@@ -454,8 +454,8 @@ def test_repeated_identical_phrase_and_discontinuity_and_scroll_up(tmp_path: Pat
         # Scroll up keeps anchor [好的收到, 在吗]
         assert runner2.run_tick(5).outcome == TickOutcome.NO_NEW_MESSAGES
         assert store2.get_last_viewport("产品测试群") == [
-            ("incoming", "", "好的收到"),
-            ("incoming", "", "在吗"),
+            ("incoming", "", "好的收到", 1),
+            ("incoming", "", "在吗", 1),
         ]
 
         # Complete discontinuity after long gap (> 90s) re-anchors safely without blasting replies

@@ -467,6 +467,44 @@ def _canonical_text(text: str) -> str:
     return re.sub(r"\s+", "", normalize_text(text))
 
 
+def _group_visual_rows(items: list[OcrBox]) -> list[list[OcrBox]]:
+    """Group OCR boxes inside an input region into visual rows ordered top-to-bottom, left-to-right."""
+    if not items:
+        return []
+    ordered = sorted(items, key=lambda b: (round(b.box.center[1], 4), round(b.box.left, 4)))
+    rows: list[list[OcrBox]] = []
+    for item in ordered:
+        cy = item.box.center[1]
+        if rows:
+            prev_row = rows[-1]
+            row_cy = sum(b.box.center[1] for b in prev_row) / len(prev_row)
+            row_h = max(b.box.height for b in prev_row)
+            if abs(cy - row_cy) <= max(0.010, row_h * 0.55):
+                prev_row.append(item)
+                continue
+        rows.append([item])
+    for row in rows:
+        row.sort(key=lambda b: round(b.box.left, 4))
+    return rows
+
+
+def _matches_logical_lines(exp_lines: list[str], obs_rows: list[str]) -> bool:
+    """Require each logical newline-separated line to begin on a fresh visual row (allowing soft-wrap)."""
+    if len(obs_rows) < len(exp_lines):
+        return False
+    idx = 0
+    for exp_line in exp_lines:
+        if idx >= len(obs_rows):
+            return False
+        acc = ""
+        while idx < len(obs_rows) and len(acc) < len(exp_line):
+            acc += obs_rows[idx]
+            idx += 1
+        if acc != exp_line:
+            return False
+    return idx == len(obs_rows)
+
+
 def verify_pasted_text(
     ocr_boxes: list[OcrBox],
     input_box: Box,
@@ -474,7 +512,7 @@ def verify_pasted_text(
     *,
     allow_upward_growth: bool = False,
 ) -> tuple[bool, str]:
-    """Verify pasted text inside `input_box` matches `expected_text` once and without duplication."""
+    """Verify pasted text inside `input_box` matches `expected_text` once, preserving hard newlines."""
     # When callers already pass the freshly detected post-paste white input box, keep a tight
     # margin (±0.015) so adjacent incoming chat bubbles immediately above never leak in.
     # Only widen upward when falling back to a pre-paste single-line input box.
@@ -491,8 +529,9 @@ def verify_pasted_text(
         if paste_region.contains(*item.box.center)
         and normalize_text(item.text) not in KEYBOARD_CUE_TOKENS
     ]
-    items.sort(key=lambda b: (round(b.box.top, 3), round(b.box.left, 3)))
-    observed_raw = "\n".join(item.text.strip() for item in items if item.text.strip())
+    visual_rows = _group_visual_rows(items)
+    row_texts = [" ".join(b.text.strip() for b in row if b.text.strip()) for row in visual_rows]
+    observed_raw = "\n".join(rt for rt in row_texts if rt)
 
     canon_obs = _canonical_text(observed_raw)
     canon_exp = _canonical_text(expected_text)
@@ -505,7 +544,15 @@ def verify_pasted_text(
     if len(canon_obs) >= int(1.85 * len(canon_exp)) and len(canon_exp) >= 2:
         return False, observed_raw
 
-    return canon_obs == canon_exp, observed_raw
+    if canon_obs != canon_exp:
+        return False, observed_raw
+
+    exp_lines = [_canonical_text(line) for line in expected_text.splitlines() if _canonical_text(line)]
+    obs_rows = [_canonical_text(rt) for rt in row_texts if _canonical_text(rt)]
+    if len(exp_lines) > 1 and not _matches_logical_lines(exp_lines, obs_rows):
+        return False, observed_raw
+
+    return True, observed_raw
 
 
 def _find_space_bar_right_edge(ocr_boxes: list[OcrBox]) -> float:

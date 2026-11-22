@@ -6,6 +6,8 @@ from wechat_agent.monitor.extractor import (
     ChatMessageExtractor,
     ViewportAlignment,
     align_viewport_suffix,
+    build_viewport_keys,
+    classify_bubble_role,
     compute_event_fingerprint,
     compute_message_fingerprint,
     mentions_any_alias,
@@ -155,7 +157,7 @@ def test_align_viewport_suffix_and_event_fingerprints() -> None:
 
     # Helper key & independent event fingerprint across event_seq
     msg = ExtractedMessage(group_title="测试群(5)", role=MessageRole.INCOMING, sender="", text="在吗")
-    assert message_viewport_key(msg) == ("incoming", "", "在吗")
+    assert message_viewport_key(msg) == ("incoming", "", "在吗", 1)
     ep1 = compute_event_fingerprint("示例分享•测试3群（198）", 1, MessageRole.INCOMING, "", "在吗")
     ep2 = compute_event_fingerprint("示例分享·测试3群(198)", 1, MessageRole.INCOMING, "", "在吗")
     ep3 = compute_event_fingerprint("示例分享·测试3群(199)", 1, MessageRole.INCOMING, "", "在吗")
@@ -260,3 +262,81 @@ def test_merge_same_sender_bursts_behavior() -> None:
         ("", "在吗", False, "e1"),
         ("", "价格多少", False, "e2"),
     ]
+
+
+def test_geometric_role_classification_self_white_card_incoming_green_image_and_centered_ambiguous() -> None:
+    # Direct boundary checks on classify_bubble_role
+    assert classify_bubble_role(0.16, 0.83, is_green=True, is_white_card=False) == MessageRole.SELF
+    assert classify_bubble_role(0.28, 0.86, is_green=False, is_white_card=True) == MessageRole.SELF
+    assert classify_bubble_role(0.14, 0.68, is_green=False, is_white_card=True) == MessageRole.INCOMING
+    # Incoming green image on the left must NEVER be misclassified as SELF (prevents false 600s takeover)
+    assert classify_bubble_role(0.14, 0.62, is_green=True, is_white_card=False) == MessageRole.UNKNOWN
+    # Centered ambiguous white/green card must be UNKNOWN and dropped
+    assert classify_bubble_role(0.26, 0.74, is_green=False, is_white_card=True) == MessageRole.UNKNOWN
+    assert classify_bubble_role(0.26, 0.74, is_green=True, is_white_card=False) == MessageRole.UNKNOWN
+    # Right avatar region (> 0.935) must be UNKNOWN
+    assert classify_bubble_role(0.86, 0.97, is_green=True, is_white_card=False) == MessageRole.UNKNOWN
+
+    # End-to-end screenshot extraction with:
+    # 1. Right-aligned SELF white link/mini-program card (must be SELF, never INCOMING self-loop)
+    # 2. Left-aligned INCOMING green-background poster/card (must be UNKNOWN & dropped, never SELF takeover)
+    # 3. Centered ambiguous white card (must be UNKNOWN & dropped)
+    # 4. Genuine left-aligned INCOMING white text bubble
+    self_white_card = Box(0.28, 0.190, 0.86, 0.280)
+    incoming_green_poster = Box(0.14, 0.320, 0.62, 0.420)
+    centered_card = Box(0.26, 0.460, 0.74, 0.540)
+    real_incoming = Box(0.14, 0.590, 0.66, 0.660)
+
+    img = make_collapsed_chat_image(
+        incoming_boxes=[self_white_card, centered_card, real_incoming],
+        outgoing_boxes=[incoming_green_poster],
+    )
+    ocr = [
+        OcrBox("示例测试群(12)", Box(0.32, 0.06, 0.68, 0.09)),
+        OcrBox("官方商品链接卡片", Box(0.31, 0.205, 0.68, 0.230)),
+        OcrBox("点击查看详情", Box(0.31, 0.238, 0.54, 0.262)),
+        OcrBox("测试群友A", Box(0.145, 0.295, 0.28, 0.315)),
+        OcrBox("限时绿色海报文字", Box(0.18, 0.350, 0.56, 0.385)),
+        OcrBox("居中模糊卡片", Box(0.36, 0.485, 0.64, 0.515)),
+        OcrBox("测试群友B", Box(0.145, 0.562, 0.28, 0.582)),
+        OcrBox("请问这个还有库存吗", Box(0.16, 0.608, 0.60, 0.640)),
+    ]
+
+    msgs = ChatMessageExtractor().extract(img, ocr, group_title="示例测试群(12)", captured_at=1000.0)
+    assert [(m.role, m.sender, m.text) for m in msgs] == [
+        (MessageRole.SELF, "", "官方商品链接卡片\n点击查看详情"),
+        (MessageRole.INCOMING, "测试群友B", "请问这个还有库存吗"),
+    ]
+
+
+def test_viewport_alignment_with_occurrences_and_repeated_short_messages() -> None:
+    # Consecutive identical short messages from the same sender carry distinct occurrences
+    b1 = Box(0.14, 0.22, 0.34, 0.28)
+    b2 = Box(0.14, 0.34, 0.34, 0.40)
+    img = make_collapsed_chat_image(incoming_boxes=[b1, b2])
+    ocr = [
+        OcrBox("示例测试群(12)", Box(0.32, 0.06, 0.68, 0.09)),
+        OcrBox("测试群友A", Box(0.145, 0.195, 0.28, 0.215)),
+        OcrBox("1", Box(0.17, 0.235, 0.24, 0.265)),
+        OcrBox("测试群友A", Box(0.145, 0.315, 0.28, 0.335)),
+        OcrBox("1", Box(0.17, 0.355, 0.24, 0.385)),
+    ]
+    msgs = ChatMessageExtractor().extract(img, ocr, group_title="示例测试群(12)", captured_at=1000.0)
+    assert [m.occurrence for m in msgs] == [1, 2]
+    keys = build_viewport_keys(msgs)
+    assert keys == [message_viewport_key(m) for m in msgs]
+    assert keys == [
+        ("incoming", "测试群友A", "1", 1),
+        ("incoming", "测试群友A", "1", 2),
+    ]
+
+    # Third identical "1" arrives -> overlap=2, new_start=2
+    curr3 = keys + [("incoming", "测试群友A", "1", 3)]
+    assert align_viewport_suffix(keys, curr3) == ViewportAlignment("aligned", 2, 2)
+
+    # First "1" scrolls off top, leaving the remaining "1" (now occurrence=1 in new frame) + new message
+    curr_scrolled = [
+        ("incoming", "测试群友A", "1", 1),
+        ("incoming", "测试群友A", "收到", 1),
+    ]
+    assert align_viewport_suffix(keys, curr_scrolled) == ViewportAlignment("aligned", 1, 1)

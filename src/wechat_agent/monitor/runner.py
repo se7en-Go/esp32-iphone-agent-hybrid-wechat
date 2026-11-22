@@ -34,8 +34,8 @@ from .decision.jev_gate import to_jev_semantics
 from .extractor import (
     ChatMessageExtractor,
     align_viewport_suffix,
+    build_viewport_keys,
     compute_event_fingerprint,
-    message_viewport_key,
 )
 from .generators.base import ReplyGenerator
 from .models import (
@@ -284,7 +284,7 @@ class MonitorRunner:
                 captured_at=now,
             )
 
-            curr_keys = [message_viewport_key(m) for m in visible]
+            curr_keys = build_viewport_keys(visible)
 
             # 4. Baseline seeding on first entry: mark existing history seen, never reply to old messages
             if not self.store.is_baseline_seeded(group_name):

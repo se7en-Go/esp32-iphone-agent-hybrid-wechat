@@ -19,7 +19,8 @@ from wechat_agent.vision.wechat_ui import has_continuous_green_bridge
 
 from .models import ExtractedMessage, MessageRole
 
-ViewportItem = tuple[str, str, str]
+ViewportItem = tuple[str, str, str, int]
+LegacyViewportItem = tuple[str, str, str]
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,13 @@ class ViewportAlignment:
 
 _VIEWPORT_TOP = 0.125
 _TOP_SAFE_TEXT_Y = 0.145
+_SELF_MIN_RIGHT_EDGE = 0.80
+_SELF_MAX_RIGHT_EDGE = 0.935
+_SELF_MIN_LEFT_EDGE = 0.13
+_SELF_WHITE_CARD_MIN_LEFT = 0.22
+_INCOMING_MIN_LEFT_EDGE = 0.10
+_INCOMING_MAX_LEFT_EDGE = 0.24
+_INCOMING_MAX_RIGHT_EDGE = 0.785
 _GROUP_COUNT_RE = re.compile(r"\s*\(\d+\)$")
 _SYSTEM_MSG_RE = re.compile(
     r"^(?:"
@@ -69,9 +77,61 @@ def compute_message_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
-def message_viewport_key(msg: ExtractedMessage) -> ViewportItem:
-    """Build the ordered canonical tuple used for viewport suffix-overlap alignment."""
-    return (msg.role.value, normalize_text(msg.sender), _canonical_for_hash(msg.text))
+def message_viewport_key(msg: ExtractedMessage, occurrence: int | None = None) -> ViewportItem:
+    """Build the ordered canonical tuple (including per-viewport occurrence) for alignment."""
+    occ = int(msg.occurrence if occurrence is None else occurrence)
+    return (msg.role.value, normalize_text(msg.sender), _canonical_for_hash(msg.text), max(1, occ))
+
+
+def build_viewport_keys(messages: Sequence[ExtractedMessage]) -> list[ViewportItem]:
+    """Compute ordered ViewportItems with per-viewport occurrence counts for repeated identical texts."""
+    counts: Counter[tuple[str, str, str]] = Counter()
+    keys: list[ViewportItem] = []
+    for msg in messages:
+        base = (msg.role.value, normalize_text(msg.sender), _canonical_for_hash(msg.text))
+        counts[base] += 1
+        keys.append((base[0], base[1], base[2], counts[base]))
+    return keys
+
+
+def _coerce_viewport_items(items: Sequence[ViewportItem | LegacyViewportItem]) -> list[ViewportItem]:
+    counts: Counter[tuple[str, str, str]] = Counter()
+    out: list[ViewportItem] = []
+    for item in items:
+        if len(item) == 4:
+            r, s, t, occ = item
+            out.append((str(r), str(s), str(t), max(1, int(occ))))
+        else:
+            r, s, t = item
+            base = (str(r), str(s), str(t))
+            counts[base] += 1
+            out.append((base[0], base[1], base[2], counts[base]))
+    return out
+
+
+def _adjust_window_occurrences(
+    prefix_scrolled: Sequence[ViewportItem],
+    window: Sequence[ViewportItem],
+) -> list[ViewportItem]:
+    """Shift window occurrences downward by the exact count of scrolled-off identical items."""
+    scrolled_counts = Counter((r, s, t) for r, s, t, _ in prefix_scrolled)
+    return [(r, s, t, max(1, occ - scrolled_counts[(r, s, t)])) for r, s, t, occ in window]
+
+
+def _viewport_slice_matches(
+    prev: Sequence[ViewportItem],
+    prev_start: int,
+    curr_slice: Sequence[ViewportItem],
+) -> bool:
+    prev_slice = prev[prev_start : prev_start + len(curr_slice)]
+    if len(prev_slice) != len(curr_slice):
+        return False
+    if list(prev_slice) == list(curr_slice):
+        return True
+    if prev_start > 0:
+        adjusted = _adjust_window_occurrences(prev[:prev_start], prev_slice)
+        return adjusted == list(curr_slice)
+    return False
 
 
 def compute_event_fingerprint(
@@ -90,12 +150,12 @@ def compute_event_fingerprint(
 
 
 def align_viewport_suffix(
-    prev_items: Sequence[ViewportItem],
-    curr_items: Sequence[ViewportItem],
+    prev_items: Sequence[ViewportItem | LegacyViewportItem],
+    curr_items: Sequence[ViewportItem | LegacyViewportItem],
 ) -> ViewportAlignment:
     """Align current visible viewport items against the tail of the previous viewport."""
-    prev = list(prev_items)
-    curr = list(curr_items)
+    prev = _coerce_viewport_items(prev_items)
+    curr = _coerce_viewport_items(curr_items)
     if not curr:
         return ViewportAlignment("empty_curr", 0, 0)
     if not prev:
@@ -103,24 +163,25 @@ def align_viewport_suffix(
 
     # 1. Primary longest suffix-prefix overlap: prev[-k:] == curr[:k]
     for k in range(min(len(prev), len(curr)), 0, -1):
-        if prev[-k:] == curr[:k]:
+        if _viewport_slice_matches(prev, len(prev) - k, curr[:k]):
             return ViewportAlignment("aligned", k, k)
 
-    # 2. Top-edge OCR flicker tolerance: skip up to leading items if prev[-k:] == curr[j : j + k] with k >= 2
+    # 2. Top-edge OCR flicker tolerance: skip leading items if prev[-k:] == curr[j : j + k] with k >= 2
     if len(prev) >= 2 and len(curr) >= 2:
         for j in range(1, len(curr) - 1):
             for k in range(min(len(prev), len(curr) - j), 1, -1):
-                if prev[-k:] == curr[j : j + k]:
+                if _viewport_slice_matches(prev, len(prev) - k, curr[j : j + k]):
                     return ViewportAlignment("aligned", k, j + k)
 
     # 3. Scroll-up / keyboard-obscured subset detection (never lose viewport tail anchor)
     if len(curr) < len(prev):
         for i in range(len(prev) - len(curr) + 1):
-            if prev[i : i + len(curr)] == curr:
+            if _viewport_slice_matches(prev, i, curr):
                 return ViewportAlignment("scroll_up", len(curr), len(curr))
 
     for m in range(min(len(prev), len(curr)), 1, -1):
-        if prev[:m] == curr[-m:]:
+        curr_tail = _adjust_window_occurrences(curr[:-m], curr[-m:])
+        if list(prev[:m]) == list(curr[-m:]) or list(prev[:m]) == curr_tail:
             return ViewportAlignment("scroll_up", m, len(curr))
 
     return ViewportAlignment("discontinuity", 0, len(curr))
@@ -347,6 +408,85 @@ def _is_top_clipped_bubble(rgb: np.ndarray | None, box: Box, canvas_lum: float) 
     return bool((row_bubble_frac[:2].mean() >= 0.30) and (row_bubble_frac.min() >= 0.25))
 
 
+def _measure_bubble_horizontal_span(
+    rgb: np.ndarray,
+    box: Box,
+    canvas_lum: float,
+) -> tuple[float, float]:
+    """Measure the contiguous non-canvas horizontal extent `(left, right)` of the bubble containing `box`."""
+    h, w, _ = rgb.shape
+    x0, y0, x1, y1 = _norm_box_to_pixels(box, w, h)
+    band = rgb[y0:y1, :, :].astype(np.int16)
+    if band.size == 0 or w <= 0:
+        return box.left, box.right
+    lum = band.mean(axis=2)
+    sat = band.max(axis=2) - band.min(axis=2)
+    col_canvas = ((np.abs(lum - canvas_lum) <= 8.0) & (sat <= 14)).mean(axis=0)
+
+    run_left = x0
+    while run_left > 0 and col_canvas[run_left - 1] < 0.65:
+        run_left -= 1
+    run_right = x1
+    while run_right < w and col_canvas[run_right] < 0.65:
+        run_right += 1
+    return run_left / w, run_right / w
+
+
+def _has_continuous_white_bridge(rgb: np.ndarray, upper: Box, lower: Box, canvas_lum: float) -> bool:
+    """Return True when the vertical gap between `upper` and `lower` stays inside a white/raised card."""
+    h, w, _ = rgb.shape
+    y0 = max(0, min(h - 1, int(round(upper.bottom * h))))
+    y1 = max(0, min(h, int(round(lower.top * h))))
+    if y1 <= y0:
+        return True
+    x_left = max(upper.left, lower.left)
+    x_right = min(upper.right, lower.right)
+    if x_right <= x_left:
+        x_left = min(upper.left, lower.left)
+        x_right = max(upper.right, lower.right)
+    x0 = max(0, min(w - 1, int(round(x_left * w))))
+    x1 = max(x0 + 1, min(w, int(round(x_right * w))))
+    patch = rgb[y0:y1, x0:x1].astype(np.int16)
+    if patch.size == 0:
+        return True
+    lum = patch.mean(axis=2)
+    sat = patch.max(axis=2) - patch.min(axis=2)
+    canvas_rows = ((np.abs(lum - canvas_lum) <= 8.0) & (sat <= 14)).mean(axis=1)
+    return bool(float(canvas_rows.max()) < 0.55)
+
+
+def classify_bubble_role(
+    bubble_left: float,
+    bubble_right: float,
+    *,
+    is_green: bool,
+    is_white_card: bool,
+) -> MessageRole:
+    """Classify a detected bubble strictly by container left/right geometry + surface type.
+
+    - SELF must hug the right bubble gutter (`0.80 <= right <= 0.935`, `left >= 0.13`),
+      accepting both green text bubbles and right-aligned white link/mini-program cards
+      (`left >= 0.22`) so own shared cards never trigger self-reply loops.
+    - INCOMING must hug the left bubble gutter (`0.10 <= left <= 0.24`) and must NOT hug
+      the right gutter (`right <= 0.785`), and must be a non-green white/raised card so
+      incoming green-background images/posters never trigger false human takeover.
+    - Centered, full-width, avatar-region, or conflicting bubbles return `MessageRole.UNKNOWN`.
+    """
+    if _SELF_MIN_RIGHT_EDGE <= bubble_right <= _SELF_MAX_RIGHT_EDGE and bubble_left >= _SELF_MIN_LEFT_EDGE:
+        if is_green:
+            return MessageRole.SELF
+        if is_white_card and bubble_left >= _SELF_WHITE_CARD_MIN_LEFT:
+            return MessageRole.SELF
+        return MessageRole.UNKNOWN
+
+    if _INCOMING_MIN_LEFT_EDGE <= bubble_left <= _INCOMING_MAX_LEFT_EDGE and bubble_right <= _INCOMING_MAX_RIGHT_EDGE:
+        if is_white_card and not is_green:
+            return MessageRole.INCOMING
+        return MessageRole.UNKNOWN
+
+    return MessageRole.UNKNOWN
+
+
 class ChatMessageExtractor:
     """Extracts structured group chat messages from screenshots + OCR detections."""
 
@@ -366,6 +506,7 @@ class ChatMessageExtractor:
         canvas_lum = _estimate_canvas_luminance(rgb, bottom_limit) if rgb is not None else 237.0
 
         self_items: list[OcrBox] = []
+        self_is_green: dict[int, bool] = {}
         incoming_items: list[OcrBox] = []
         canvas_labels: list[OcrBox] = []
         clipped_regions: list[Box] = []
@@ -385,21 +526,39 @@ class ChatMessageExtractor:
 
             if rgb is not None:
                 green_r, white_r = _bubble_ratios(rgb, item.box, canvas_lum)
-                if 0.13 <= item.box.left <= 0.83 and green_r >= 0.15:
-                    self_items.append(item)
-                    continue
-                if item.box.left <= 0.56 and white_r >= 0.30 and _has_white_above(rgb, item.box, canvas_lum):
-                    if not _is_white_sticker_caption(rgb, item.box, canvas_lum, bottom_limit):
-                        incoming_items.append(item)
+                is_green = green_r >= 0.15
+                is_white = white_r >= 0.30 and _has_white_above(rgb, item.box, canvas_lum)
+                if is_green or is_white:
+                    b_left, b_right = _measure_bubble_horizontal_span(rgb, item.box, canvas_lum)
+                    role = classify_bubble_role(
+                        b_left,
+                        b_right,
+                        is_green=is_green,
+                        is_white_card=is_white,
+                    )
+                    if role == MessageRole.SELF and item.box.left <= 0.84:
+                        self_items.append(item)
+                        self_is_green[id(item)] = is_green
+                    elif role == MessageRole.INCOMING:
+                        if not _is_white_sticker_caption(rgb, item.box, canvas_lum, bottom_limit):
+                            incoming_items.append(item)
+                    # Ambiguous/UNKNOWN bubble or card is intentionally dropped (never leaks into canvas_labels).
                     continue
                 if not _SYSTEM_MSG_RE.match(text):
                     canvas_labels.append(item)
             else:
                 if _SYSTEM_MSG_RE.match(text):
                     continue
-                if item.box.center[0] >= 0.56 and item.box.right >= 0.42:
+                if (
+                    _SELF_MIN_RIGHT_EDGE <= item.box.right <= _SELF_MAX_RIGHT_EDGE
+                    and item.box.left >= _SELF_MIN_LEFT_EDGE
+                ):
                     self_items.append(item)
-                elif item.box.left <= 0.34:
+                    self_is_green[id(item)] = True
+                elif (
+                    _INCOMING_MIN_LEFT_EDGE <= item.box.left <= _INCOMING_MAX_LEFT_EDGE
+                    and item.box.right <= _INCOMING_MAX_RIGHT_EDGE
+                ):
                     incoming_items.append(item)
 
         def _overlaps_clipped_group(box: Box) -> bool:
@@ -424,7 +583,14 @@ class ChatMessageExtractor:
                     aligned = abs(item.box.left - prev.box.left) <= 0.09 or abs(item.box.right - prev.box.right) <= 0.12
                     same_group = -0.005 <= vgap <= 0.032 and aligned
                     if same_group and rgb is not None:
-                        same_group = has_continuous_green_bridge(rgb, prev.box, item.box)
+                        prev_green = self_is_green.get(id(prev), True)
+                        curr_green = self_is_green.get(id(item), True)
+                        if prev_green != curr_green:
+                            same_group = False
+                        elif prev_green:
+                            same_group = has_continuous_green_bridge(rgb, prev.box, item.box)
+                        else:
+                            same_group = _has_continuous_white_bridge(rgb, prev.box, item.box, canvas_lum)
                 else:
                     aligned = abs(item.box.left - prev.box.left) <= 0.09
                     same_group = -0.005 <= vgap <= 0.032 and aligned
@@ -482,6 +648,7 @@ class ChatMessageExtractor:
                     mentioned_self=msg.mentioned_self,
                     fingerprint=fp,
                     captured_at=msg.captured_at,
+                    occurrence=occ_counts[key],
                 )
             )
         return finalized

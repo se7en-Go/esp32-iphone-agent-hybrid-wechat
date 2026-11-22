@@ -23,8 +23,10 @@ from wechat_agent.evidence import redact_dict
 from wechat_agent.vision.geometry import canonicalize_chat_title, normalize_text
 
 from .extractor import (
+    LegacyViewportItem,
     ViewportItem,
     _canonical_for_hash,
+    _coerce_viewport_items,
     compute_event_fingerprint,
     merge_same_sender_bursts,
 )
@@ -264,21 +266,30 @@ class MonitorStore:
             return []
         if not isinstance(parsed, list):
             return []
-        return [
-            (str(item[0]), str(item[1]), str(item[2]))
-            for item in parsed
-            if isinstance(item, (list, tuple)) and len(item) == 3
-        ]
+        raw_items: list[ViewportItem | LegacyViewportItem] = []
+        for item in parsed:
+            if not isinstance(item, (list, tuple)):
+                continue
+            if len(item) == 4:
+                try:
+                    occ = max(1, int(item[3]))
+                except (TypeError, ValueError):
+                    occ = 1
+                raw_items.append((str(item[0]), str(item[1]), str(item[2]), occ))
+            elif len(item) == 3:
+                raw_items.append((str(item[0]), str(item[1]), str(item[2])))
+        return _coerce_viewport_items(raw_items)
 
     def _save_last_viewport_in_tx(
         self,
         norm_group: str,
-        items: Sequence[ViewportItem],
+        items: Sequence[ViewportItem | LegacyViewportItem],
         *,
         ts: float,
         mark_baseline: bool = False,
     ) -> None:
-        payload = json.dumps([[r, s, t] for r, s, t in items], ensure_ascii=False)
+        normalized = _coerce_viewport_items(items)
+        payload = json.dumps([[r, s, t, occ] for r, s, t, occ in normalized], ensure_ascii=False)
         self._ensure_group_row(norm_group)
         if mark_baseline:
             self._conn.execute(
@@ -623,7 +634,12 @@ class MonitorStore:
                 )
 
     def claim_bot_reply_match(self, group_title: str, text: str, *, since_ts: float) -> bool:
-        """Consume an unacknowledged `sent_confirmed` bot reply matching `text` to avoid false takeover."""
+        """Consume an unacknowledged `sent_confirmed` bot reply matching `text` to avoid false takeover.
+
+        Requires exact normalized equality, or — for long replies (>= 10 canonical chars) — a
+        high-ratio (>= 85%) containment match to tolerate minor single-edge OCR truncation without
+        ever allowing a human message containing a short bot reply (e.g. "好的") to swallow the match.
+        """
         canon = re.sub(r"\s+", "", normalize_text(text))
         if not canon:
             return False
@@ -638,7 +654,14 @@ class MonitorStore:
         ).fetchall()
         for row in rows:
             row_canon = re.sub(r"\s+", "", normalize_text(str(row["reply_text"] or "")))
-            if row_canon and (row_canon == canon or (len(row_canon) >= 2 and row_canon in canon)):
+            if not row_canon:
+                continue
+            matched = row_canon == canon
+            if not matched and len(row_canon) >= 10 and len(canon) >= 10:
+                ratio = min(len(row_canon), len(canon)) / max(len(row_canon), len(canon))
+                if ratio >= 0.85 and (row_canon in canon or canon in row_canon):
+                    matched = True
+            if matched:
                 with self._conn:
                     self._conn.execute(
                         "UPDATE reply_history SET status = 'sent_confirmed_seen' WHERE id = ?",

@@ -13,6 +13,7 @@ class MessageRole(str, Enum):
     INCOMING = "incoming"
     SELF = "self"
     SYSTEM = "system"
+    UNKNOWN = "unknown"
 
 
 class MonitorMode(str, Enum):
@@ -31,6 +32,7 @@ class ExtractedMessage:
     mentioned_self: bool = False
     fingerprint: str = ""
     captured_at: float = 0.0
+    occurrence: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
