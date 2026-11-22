@@ -196,6 +196,7 @@ class FakePhoneDriver:
         self.skill_confirm_handler: Callable[[bool, str, str], SkillConfirmResult] | None = None
 
         self._obs_counter = 0
+        self._last_observed_bytes = b""
 
     def status(self) -> dict[str, Any]:
         self.calls.append(("status", {}))
@@ -257,13 +258,15 @@ class FakePhoneDriver:
                 if isinstance(nxt, Exception):
                     raise nxt
                 return nxt
-            return Observation(screen_id=f"scr-fc-{self._obs_counter}", image_bytes=b"")
+            return Observation(screen_id=f"scr-fc-{self._obs_counter}", image_bytes=self._last_observed_bytes)
         if self.observe_queue:
             nxt = self.observe_queue.pop(0)
             if isinstance(nxt, Exception):
                 raise nxt
+            if nxt.image_bytes:
+                self._last_observed_bytes = nxt.image_bytes
             return nxt
-        return Observation(screen_id=f"scr-{self._obs_counter}", image_bytes=b"")
+        return Observation(screen_id=f"scr-{self._obs_counter}", image_bytes=self._last_observed_bytes)
 
     def point(
         self,

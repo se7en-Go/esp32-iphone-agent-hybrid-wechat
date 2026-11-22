@@ -709,3 +709,130 @@ def test_dry_run_4line_multiline_paste_with_adjacent_incoming_bubble_succeeds(tm
     assert rep.status == SendStatus.DRY_RUN_READY
     assert "post_paste_verified" in rep.steps
 
+
+def test_for_click_frame_drift_and_pre_send_409_drift_abort_without_clicking(tmp_path: Path) -> None:
+    # Part A: Screen drifts to another chat on observe(for_click=True) -> MUST abort with ZERO click_observed
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    frames = _register_happy_chat_flow(driver, ocr, message_text="防漂移校验")
+
+    wrong_chat_img = make_keyboard_chat_image(blue_send=True, with_caret=True) + b"wrong_chat"
+    ocr.register(
+        wrong_chat_img,
+        [
+            OcrBox("无关会话", Box(0.35, 0.06, 0.65, 0.09)),
+            OcrBox("防漂移校验", Box(0.18, 0.53, 0.52, 0.55)),
+            OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+            OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+        ],
+    )
+    driver.observe_queue = [
+        Observation(screen_id="scr-kb", image_bytes=frames["focused_empty"]),
+        Observation(screen_id="scr-pasted", image_bytes=frames["pasted"]),
+    ]
+    driver.observe_for_click_queue = [
+        Observation(screen_id="scr-fc-wrong", image_bytes=wrong_chat_img),
+    ]
+    rep = SendMessageWorkflow(driver, ocr, _config(tmp_path)).run("文件传输助手", "防漂移校验", send=True)
+    assert rep.status == SendStatus.ABORTED_PASTE_VERIFY
+    assert not any(name == "click_observed" for name, _ in driver.calls)
+    assert not any(name == "skill_confirm_send" for name, _ in driver.calls)
+
+    # Part B: Pre-send point hits 409 and re-observed frame lost draft -> aborts cleanly with ZERO click_observed
+    driver2 = FakePhoneDriver()
+    ocr2 = MockOcrEngine()
+    frames2 = _register_happy_chat_flow(driver2, ocr2, message_text="重观防漂移")
+    driver2.observe_queue = [
+        Observation(screen_id="scr-kb2", image_bytes=frames2["focused_empty"]),
+        Observation(screen_id="scr-pasted2", image_bytes=frames2["pasted"]),
+        # Re-observed frame after 409 has empty input box (draft gone)
+        Observation(screen_id="scr-reobs-empty", image_bytes=frames2["focused_empty"]),
+    ]
+    driver2.point_handler = lambda *args: (_ for _ in ()).throw(
+        ConflictError("HTTP 409: caret blinked", status_code=409)
+    )
+    rep2 = SendMessageWorkflow(driver2, ocr2, _config(tmp_path)).run("文件传输助手", "重观防漂移", send=True)
+    assert rep2.status == SendStatus.ABORTED_PASTE_VERIFY
+    assert not any(name == "click_observed" for name, _ in driver2.calls)
+
+
+@pytest.mark.parametrize(
+    ("clicked", "acked"),
+    [(False, True), (True, False), (False, False)],
+)
+def test_unacknowledged_send_click_never_settles_as_sent(
+    tmp_path: Path,
+    clicked: bool,
+    acked: bool,
+) -> None:
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    frames = _register_happy_chat_flow(driver, ocr, message_text="点击未确认禁止结算", bubble_after_send=True)
+    driver.observe_queue = [
+        Observation(screen_id="scr-kb", image_bytes=frames["focused_empty"]),
+        Observation(screen_id="scr-pasted", image_bytes=frames["pasted"]),
+    ]
+    # Even though returned screenshot has a matching green bubble, clicked/acked is False!
+    driver.click_handler = lambda *args: ClickResult(
+        screen_id="scr-sent",
+        clicked=clicked,
+        command_acknowledged=acked,
+        image_bytes=frames["sent"],
+    )
+    rep = SendMessageWorkflow(driver, ocr, _config(tmp_path)).run("文件传输助手", "点击未确认禁止结算", send=True)
+    assert rep.status == SendStatus.SEND_UNCONFIRMED
+    assert not any(name == "skill_confirm_send" for name, _ in driver.calls)
+
+
+def test_post_send_wrong_title_never_settles_as_sent(tmp_path: Path) -> None:
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    frames = _register_happy_chat_flow(driver, ocr, message_text="发送后验标题", bubble_after_send=True)
+
+    wrong_post_img = make_collapsed_chat_image(outgoing_boxes=[Box(0.55, 0.40, 0.90, 0.46)]) + b"wrong_post"
+    ocr.register(
+        wrong_post_img,
+        [
+            OcrBox("另一个会话", Box(0.35, 0.06, 0.65, 0.09)),
+            OcrBox("发送后验标题", Box(0.58, 0.415, 0.86, 0.445)),
+        ],
+    )
+    driver.observe_queue = [
+        Observation(screen_id="scr-kb", image_bytes=frames["focused_empty"]),
+        Observation(screen_id="scr-pasted", image_bytes=frames["pasted"]),
+        Observation(screen_id="scr-reobs-wrong", image_bytes=wrong_post_img),
+    ]
+    driver.click_handler = lambda *args: ClickResult(
+        screen_id="scr-sent-wrong",
+        clicked=True,
+        command_acknowledged=True,
+        image_bytes=wrong_post_img,
+    )
+    rep = SendMessageWorkflow(driver, ocr, _config(tmp_path)).run("文件传输助手", "发送后验标题", send=True)
+    assert rep.status == SendStatus.SEND_UNCONFIRMED
+    assert "title" in rep.message.lower()
+    assert not any(name == "skill_confirm_send" for name, _ in driver.calls)
+
+
+def test_navigation_single_frame_ocr_miss_recovers_with_passive_reobserve(tmp_path: Path) -> None:
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    frames = _register_happy_chat_flow(driver, ocr, message_text="单帧漏检恢复")
+
+    blank_ocr_img = make_collapsed_chat_image() + b"blank_ocr"
+    ocr.register(blank_ocr_img, [])  # Single-frame transient OCR miss -> ScreenKind.UNKNOWN
+
+    driver.observe_queue = [
+        Observation(screen_id="scr-miss", image_bytes=blank_ocr_img),
+        Observation(screen_id="scr-recovered", image_bytes=frames["focused_empty"]),
+        Observation(screen_id="scr-pasted", image_bytes=frames["pasted"]),
+    ]
+    sleeps: list[float] = []
+    rep = SendMessageWorkflow(driver, ocr, _config(tmp_path), sleeper=sleeps.append).run(
+        "文件传输助手",
+        "单帧漏检恢复",
+        send=False,
+    )
+    assert rep.status == SendStatus.DRY_RUN_READY
+    assert sleeps == [0.3]
+

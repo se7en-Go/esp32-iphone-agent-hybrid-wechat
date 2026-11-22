@@ -56,6 +56,7 @@ class WeChatNavigator:
         sync_poll_interval: float = DEFAULT_SYNC_POLL_INTERVAL,
         max_sync_wait_attempts: int = DEFAULT_MAX_SYNC_WAIT_ATTEMPTS,
         conflict_backoff_seconds: tuple[float, ...] = DEFAULT_CONFLICT_BACKOFF_SECONDS,
+        max_ocr_miss_reobserves: int = 1,
     ) -> None:
         self.driver = driver
         self.ocr = ocr
@@ -66,6 +67,7 @@ class WeChatNavigator:
         self.sync_poll_interval = float(sync_poll_interval)
         self.max_sync_wait_attempts = max(0, int(max_sync_wait_attempts))
         self.conflict_backoff_seconds = tuple(float(s) for s in conflict_backoff_seconds)
+        self.max_ocr_miss_reobserves = max(0, int(max_ocr_miss_reobserves))
 
     def _sleep(self, seconds: float) -> None:
         if seconds <= 0:
@@ -96,8 +98,9 @@ class WeChatNavigator:
         scroll_attempts = 0
         back_attempts = 0
         conflict_retries = 0
+        ocr_miss_reobserves = 0
         max_conflict_retries = len(self.conflict_backoff_seconds)
-        max_steps = max(12, 7 + max_conflict_retries)
+        max_steps = max(12, 7 + max_conflict_retries + self.max_ocr_miss_reobserves)
 
         for step in range(max_steps):
             kind = detect_screen_context(
@@ -227,6 +230,20 @@ class WeChatNavigator:
                         )
                         ocr_boxes = self.ocr.read_boxes(obs.image_bytes)
                         continue
+                    if ocr_miss_reobserves < self.max_ocr_miss_reobserves:
+                        ocr_miss_reobserves += 1
+                        self.evidence.log_event(
+                            "nav_ocr_miss_reobserve",
+                            {"step": step, "attempt": ocr_miss_reobserves, "kind": kind.value},
+                        )
+                        self._sleep(0.3)
+                        obs = self.driver.observe(
+                            image_output=self.evidence.image_output_path(
+                                f"nav_chat_list_reobs_{step}_{ocr_miss_reobserves}"
+                            )
+                        )
+                        ocr_boxes = self.ocr.read_boxes(obs.image_bytes)
+                        continue
                     raise NavigationError(f"Conversation {target_title!r} not found in WeChat chat list")
 
                 if kind == ScreenKind.OTHER_CHAT and back_attempts < 1:
@@ -239,6 +256,19 @@ class WeChatNavigator:
                         step_name=f"nav_back_{step}",
                     )
                     obs = self._next_observation(click_res, f"nav_after_back_{step}")
+                    ocr_boxes = self.ocr.read_boxes(obs.image_bytes)
+                    continue
+
+                if kind == ScreenKind.UNKNOWN and ocr_miss_reobserves < self.max_ocr_miss_reobserves:
+                    ocr_miss_reobserves += 1
+                    self.evidence.log_event(
+                        "nav_ocr_miss_reobserve",
+                        {"step": step, "attempt": ocr_miss_reobserves, "kind": kind.value},
+                    )
+                    self._sleep(0.3)
+                    obs = self.driver.observe(
+                        image_output=self.evidence.image_output_path(f"nav_ocr_reobs_{step}_{ocr_miss_reobserves}")
+                    )
                     ocr_boxes = self.ocr.read_boxes(obs.image_bytes)
                     continue
 

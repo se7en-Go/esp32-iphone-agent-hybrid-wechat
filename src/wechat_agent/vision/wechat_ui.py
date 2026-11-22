@@ -78,19 +78,25 @@ def _has_bottom_wechat_tabs(ocr_boxes: list[OcrBox]) -> bool:
     return len(bottom_tokens) >= 2
 
 
-def extract_header_title(ocr_boxes: list[OcrBox]) -> str | None:
-    """Return the normalized top navigation header title if present."""
-    candidates = [
+_STRICT_GROUP_COUNT_RE = re.compile(r"^\(([1-9]\d{0,3})\)$")
+_MAX_GROUP_MEMBER_COUNT = 2000
+
+
+def _header_title_candidates(ocr_boxes: list[OcrBox]) -> list[OcrBox]:
+    """Return non-empty OCR boxes inside the WeChat iOS top navigation title slot (excluding status bar)."""
+    return [
         b
         for b in ocr_boxes
-        if 0.045 <= b.box.top and b.box.bottom <= 0.14 and 0.14 <= b.box.center[0] <= 0.86
+        if 0.045 <= b.box.top
+        and b.box.bottom <= 0.14
+        and 0.14 <= b.box.center[0] <= 0.86
+        and normalize_text(b.text)
     ]
-    if not candidates:
-        candidates = [
-            b
-            for b in ocr_boxes
-            if 0.03 <= b.box.top and b.box.bottom <= 0.14 and 0.18 <= b.box.center[0] <= 0.82
-        ]
+
+
+def extract_header_title(ocr_boxes: list[OcrBox]) -> str | None:
+    """Return the normalized primary top navigation header title if present."""
+    candidates = _header_title_candidates(ocr_boxes)
     if not candidates:
         return None
     candidates.sort(key=lambda b: abs(b.box.center[0] - 0.5))
@@ -104,25 +110,27 @@ def has_exact_chat_title(
     *,
     allow_group_count: bool = False,
 ) -> bool:
-    """Return True if the top navigation header uniquely shows `target_title`."""
+    """Return True iff the unique primary top-bar header title strictly matches `target_title`.
+
+    When `allow_group_count=True`, accepts ONLY a single trailing standard member count `(N)`
+    with `1 <= N <= 2000` and no leading zeros or extra characters. Rejects ambiguous screens
+    with multiple conflicting title boxes or stray non-header matches (e.g. status-bar / banner).
+    """
     target_canon = canonicalize_chat_title(target_title)
     if not target_canon:
         return False
-    group_pattern = (
-        re.compile(re.escape(target_canon) + r"\(\d+\)")
-        if allow_group_count
-        else None
-    )
-    for item in ocr_boxes:
-        if item.box.top < 0.03 or item.box.bottom > 0.14:
-            continue
-        cx = item.box.center[0]
-        if not (0.14 <= cx <= 0.86):
-            continue
-        item_canon = canonicalize_chat_title(item.text)
-        if item_canon == target_canon:
-            return True
-        if group_pattern is not None and group_pattern.fullmatch(item_canon):
+
+    candidates = _header_title_candidates(ocr_boxes)
+    if len(candidates) != 1:
+        return False
+
+    item_canon = canonicalize_chat_title(candidates[0].text)
+    if item_canon == target_canon:
+        return True
+    if allow_group_count and item_canon.startswith(target_canon):
+        suffix = item_canon[len(target_canon) :]
+        m = _STRICT_GROUP_COUNT_RE.fullmatch(suffix)
+        if m is not None and 1 <= int(m.group(1)) <= _MAX_GROUP_MEMBER_COUNT:
             return True
     return False
 
@@ -789,9 +797,13 @@ def has_new_outgoing_bubble(
     base_counts = Counter(_canonical_text(b) for b in baseline_bubbles)
     curr_counts = Counter(_canonical_text(b) for b in current_bubbles)
 
-    # Check if an exact/containing bubble increased in count compared to pre-send baseline.
+    # Check if an exact (or long-text >=85% OCR-edge-truncated) bubble increased in count over baseline.
     for canon_msg, count in curr_counts.items():
         if count > base_counts.get(canon_msg, 0):
-            if canon_msg == canon_expected or (len(canon_expected) >= 2 and canon_expected in canon_msg):
+            if canon_msg == canon_expected:
                 return True
+            if len(canon_expected) >= 10 and len(canon_msg) >= 10:
+                ratio = min(len(canon_expected), len(canon_msg)) / max(len(canon_expected), len(canon_msg))
+                if ratio >= 0.85 and (canon_expected in canon_msg or canon_msg in canon_expected):
+                    return True
     return False

@@ -341,3 +341,58 @@ def test_verify_pasted_text_enforces_hard_newline_structure() -> None:
     assert ok_soft is True
 
 
+def test_header_title_unique_primary_box_strict_group_count_and_tight_outgoing_bubble() -> None:
+    import pytest
+
+    from wechat_agent.guards.target_policy import PolicyViolationError, TargetPolicy
+
+    # 1. Stray status-bar/banner match at top < 0.045 must NOT pass when nav header shows another chat
+    stray_banner = [
+        OcrBox("示例测试群(12)", Box(0.28, 0.025, 0.72, 0.042)),
+        OcrBox("无关聊天", Box(0.35, 0.06, 0.65, 0.09)),
+    ]
+    assert has_exact_chat_title(stray_banner, "示例测试群", allow_group_count=True) is False
+
+    # 2. Ambiguous / duplicate nav-bar header boxes must be rejected
+    dual_header = [
+        OcrBox("示例测试群(12)", Box(0.18, 0.06, 0.48, 0.09)),
+        OcrBox("提示横幅", Box(0.54, 0.06, 0.80, 0.09)),
+    ]
+    assert has_exact_chat_title(dual_header, "示例测试群", allow_group_count=True) is False
+
+    # 3. Strict allow_group_count accepts 1..2000 with no leading zeros and rejects malformed suffixes
+    for good in ("示例测试群(1)", "示例测试群(12)", "示例测试群（500）", "示例测试群(2000)"):
+        assert has_exact_chat_title([OcrBox(good, Box(0.28, 0.06, 0.72, 0.09))], "示例测试群", allow_group_count=True)
+    for bad in ("示例测试群(0)", "示例测试群(01)", "示例测试群(2001)", "示例测试群(99999)", "示例测试群(12人)"):
+        assert (
+            has_exact_chat_title([OcrBox(bad, Box(0.28, 0.06, 0.72, 0.09))], "示例测试群", allow_group_count=True)
+            is False
+        )
+
+    # 4. Tightened has_new_outgoing_bubble rejects short substring match while allowing exact / long OCR truncation
+    assert has_new_outgoing_bubble([], ["好的，马上处理"], "好的") is False
+    assert has_new_outgoing_bubble([], ["好的"], "好的") is True
+    assert has_new_outgoing_bubble(["好的"], ["好的", "好的"], "好的") is True
+    assert (
+        has_new_outgoing_bubble(
+            [],
+            ["请按群内官方团购链接下单即可"],
+            "请按群内官方团购链接下单即可哦",
+        )
+        is True
+    )
+    assert (
+        has_new_outgoing_bubble(
+            [],
+            ["补充说明：请按群内官方团购链接下单即可哦，有任何问题欢迎联系群主"],
+            "请按群内官方团购链接下单即可哦",
+        )
+        is False
+    )
+
+    # 5. TargetPolicy rejects wildcard / control characters
+    for bad_target in ("*", "all", "测试\n群"):
+        with pytest.raises(PolicyViolationError):
+            TargetPolicy([bad_target])
+
+

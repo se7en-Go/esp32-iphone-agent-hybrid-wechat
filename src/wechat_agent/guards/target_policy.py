@@ -11,10 +11,19 @@ class PolicyViolationError(RuntimeError):
 
 class TargetPolicy:
     def __init__(self, allowed_targets: tuple[str, ...] | list[str]) -> None:
-        normalized = tuple(canonicalize_chat_title(t) for t in allowed_targets if canonicalize_chat_title(t))
+        normalized: list[str] = []
+        for raw in allowed_targets:
+            if not isinstance(raw, str) or any(ord(ch) < 32 for ch in raw):
+                raise PolicyViolationError(f"Invalid allowed target entry: {raw!r}")
+            canon = canonicalize_chat_title(raw)
+            if not canon:
+                continue
+            if canon in {"*", "all", "ANY"}:
+                raise PolicyViolationError(f"Invalid allowed target entry: {raw!r}")
+            normalized.append(canon)
         if not normalized:
             raise PolicyViolationError("allowed_targets must not be empty")
-        self.allowed_targets = normalized
+        self.allowed_targets = tuple(normalized)
 
     def is_allowed(self, target: str) -> bool:
         canon = canonicalize_chat_title(target)

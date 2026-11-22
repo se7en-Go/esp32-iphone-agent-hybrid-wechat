@@ -30,7 +30,7 @@ from wechat_agent.vision.wechat_ui import (
     verify_pasted_text,
 )
 
-from .click_chain import ClickChain, PointerConflictError, PointerNotConfirmedError
+from .click_chain import ClickChain, PointerConflictError, PointerNotConfirmedError, SendPreconditionError
 from .navigation import NavigationError, WeChatNavigator
 
 
@@ -231,7 +231,7 @@ class SendMessageWorkflow:
                     ocr_boxes = self.ocr.read_boxes(obs.image_bytes)
                     focused = detect_keyboard_and_focused_input(obs.image_bytes, ocr_boxes)
                     if focused is None:
-                        # Passive re-observe once (NO second click!) in case iOS keyboard animation settled slightly later.
+                        # Passive re-observe once (NO second click!) if iOS keyboard animation settled late.
                         time.sleep(0.25)
                         obs = self.driver.observe(image_output=evidence.image_output_path("02_after_focus_reobs"))
                         ocr_boxes = self.ocr.read_boxes(obs.image_bytes)
@@ -396,7 +396,51 @@ class SendMessageWorkflow:
         steps.append("send_slot_reserved")
 
         # 12. Pre-send pointer move ONLY (allows HTTP 409 caret-blink retry, NEVER clicks)
-        # Pass verified input box as explicit --caret-scope alongside server 120s carry-over.
+        # Re-verify title, pasted text, and Send button dynamically on any fresh re-observed or for_click frame.
+        def _verify_fresh_send_frame(frame_obs: Observation) -> tuple[Box, str, Box | None]:
+            if not frame_obs.image_bytes:
+                raise SendPreconditionError(
+                    "Empty screenshot frame before Send click; aborting without clicking.",
+                    status=SendStatus.ABORTED_PASTE_VERIFY,
+                )
+            frame_ocr = self.ocr.read_boxes(frame_obs.image_bytes)
+            frame_check = self.skill_guard.check_screen_text(frame_ocr)
+            if frame_check.stop:
+                raise SendPreconditionError(
+                    f"Circuit breaker triggered before Send click: {frame_check.reason}",
+                    status=SendStatus.ABORTED_RISK_PHRASE,
+                )
+            if not has_exact_chat_title(
+                frame_ocr,
+                clean_target,
+                allow_group_count=self.config.allow_group_count,
+            ):
+                raise SendPreconditionError(
+                    f"Conversation title verification failed on fresh pre-send frame (expected {clean_target!r})",
+                    status=SendStatus.ABORTED_PASTE_VERIFY,
+                )
+            focused_now = detect_keyboard_and_focused_input(frame_obs.image_bytes, frame_ocr)
+            fresh_input = focused_now.input_box if focused_now is not None else active_input_box
+            ok_text, obs_text = verify_pasted_text(
+                frame_ocr,
+                fresh_input,
+                clean_text,
+                allow_upward_growth=(focused_now is None),
+            )
+            if not ok_text:
+                raise SendPreconditionError(
+                    f"Pasted draft drifted on fresh pre-send frame (observed={obs_text!r}, expected={clean_text!r})",
+                    status=SendStatus.ABORTED_PASTE_VERIFY,
+                )
+            fresh_send_loc = locate_blue_send_button(frame_obs.image_bytes, frame_ocr)
+            if fresh_send_loc is None:
+                raise SendPreconditionError(
+                    "Blue Send button disappeared on fresh pre-send frame",
+                    status=SendStatus.ABORTED_SEND_BUTTON,
+                )
+            fresh_box, fresh_label = fresh_send_loc
+            return fresh_box, fresh_label, fresh_input
+
         evidence.log_event("pre_send_caret_scope", {"caret_scope": active_input_box.as_list()})
         try:
             mp, _ = click_chain.pre_send_point_with_caret_retry(
@@ -406,6 +450,13 @@ class SendMessageWorkflow:
                 max_attempts=self.config.pre_send_point_retries,
                 initial_screen_id=post_obs.screen_id,
                 caret_scope=active_input_box,
+                reverify_observation=_verify_fresh_send_frame,
+            )
+        except SendPreconditionError as exc:
+            return report(
+                exc.status,
+                str(exc),
+                paste_receipt=redacted_receipt,
             )
         except PointerNotConfirmedError as exc:
             return report(
@@ -419,9 +470,15 @@ class SendMessageWorkflow:
                 f"Pre-send pointer positioning failed: {exc}",
                 paste_receipt=redacted_receipt,
             )
+        if click_chain.last_verified_send_box is not None:
+            send_box = click_chain.last_verified_send_box
+        if click_chain.last_verified_send_label:
+            send_label = click_chain.last_verified_send_label
+        if click_chain.last_verified_caret_scope is not None:
+            active_input_box = click_chain.last_verified_caret_scope
         steps.append("pre_send_pointer_confirmed")
 
-        # 13. Single-shot Send click — NEVER retry click_observed under any circumstances
+        # 13. Single-shot Send click — re-verifies for_click frame before clicking; NEVER retries click_observed
         try:
             send_click_res = click_chain.single_shot_send_click(
                 mp,
@@ -429,6 +486,19 @@ class SendMessageWorkflow:
                 send_label,
                 step_name="send_click",
                 caret_scope=active_input_box,
+                verify_for_click=_verify_fresh_send_frame,
+            )
+        except SendPreconditionError as exc:
+            return report(
+                exc.status,
+                str(exc),
+                paste_receipt=redacted_receipt,
+            )
+        except PointerConflictError as exc:
+            return report(
+                SendStatus.ABORTED_POINTER,
+                f"Pre-click observe(--for-click) hit 409 before Send was clicked ({exc}); zero click dispatched.",
+                paste_receipt=redacted_receipt,
             )
         except DriverError as exc:
             return report(
@@ -436,9 +506,26 @@ class SendMessageWorkflow:
                 f"Send click errored ({exc}); click will NOT be retried. Re-observe screen manually.",
                 paste_receipt=redacted_receipt,
             )
+
+        # Explicitly require clicked & command_acknowledged before allowing bubble-scan settlement.
+        if not send_click_res.clicked or not send_click_res.command_acknowledged:
+            evidence.log_event(
+                "send_click_not_acknowledged",
+                {
+                    "clicked": send_click_res.clicked,
+                    "command_acknowledged": send_click_res.command_acknowledged,
+                },
+            )
+            return report(
+                SendStatus.SEND_UNCONFIRMED,
+                f"Send click was not acknowledged by driver "
+                f"(clicked={send_click_res.clicked}, command_acknowledged={send_click_res.command_acknowledged}); "
+                "refusing to settle as sent or retry.",
+                paste_receipt=redacted_receipt,
+            )
         steps.append("send_click_dispatched")
 
-        # 14. Post-send verification: must see a NEW complete green outgoing bubble before skill-confirm-send
+        # 14. Post-send verification: must see exact target title AND a NEW green outgoing bubble
         try:
             if send_click_res.image_bytes:
                 final_bytes = send_click_res.image_bytes
@@ -454,12 +541,17 @@ class SendMessageWorkflow:
                     paste_receipt=redacted_receipt,
                 )
 
+            title_ok = has_exact_chat_title(
+                final_ocr,
+                clean_target,
+                allow_group_count=self.config.allow_group_count,
+            )
             final_bubbles = extract_outgoing_bubbles(
                 final_bytes,
                 final_ocr,
                 chat_area=Box(0.0, 0.13, 1.0, 0.87),
             )
-            bubble_ok = has_new_outgoing_bubble(baseline_bubbles, final_bubbles, clean_text)
+            bubble_ok = title_ok and has_new_outgoing_bubble(baseline_bubbles, final_bubbles, clean_text)
             if not bubble_ok:
                 # One passive re-observe in case mirror lag delayed bubble rendering; NEVER re-click Send.
                 reobs = self.driver.observe(image_output=evidence.image_output_path("06_post_send_reobs"))
@@ -471,12 +563,17 @@ class SendMessageWorkflow:
                         f"Circuit breaker triggered on post-send re-observe: {recheck.reason}",
                         paste_receipt=redacted_receipt,
                     )
+                title_ok = has_exact_chat_title(
+                    final_ocr,
+                    clean_target,
+                    allow_group_count=self.config.allow_group_count,
+                )
                 final_bubbles = extract_outgoing_bubbles(
                     reobs.image_bytes,
                     final_ocr,
                     chat_area=Box(0.0, 0.13, 1.0, 0.87),
                 )
-                bubble_ok = has_new_outgoing_bubble(baseline_bubbles, final_bubbles, clean_text)
+                bubble_ok = title_ok and has_new_outgoing_bubble(baseline_bubbles, final_bubbles, clean_text)
         except DriverError as exc:
             return report(
                 SendStatus.SEND_UNCONFIRMED,
@@ -484,10 +581,19 @@ class SendMessageWorkflow:
                 paste_receipt=redacted_receipt,
             )
 
+        if not title_ok:
+            return report(
+                SendStatus.SEND_UNCONFIRMED,
+                f"Post-send frame did not match target conversation title {clean_target!r}; "
+                "refusing to settle as sent.",
+                paste_receipt=redacted_receipt,
+            )
+
         if not bubble_ok:
             return report(
                 SendStatus.SEND_UNCONFIRMED,
-                "New outgoing green bubble was NOT confirmed on screen (input clearing or hardware ok does not prove delivery).",
+                "New outgoing green bubble was NOT confirmed on screen "
+                "(input clearing or hardware ok does not prove delivery).",
                 paste_receipt=redacted_receipt,
             )
 
