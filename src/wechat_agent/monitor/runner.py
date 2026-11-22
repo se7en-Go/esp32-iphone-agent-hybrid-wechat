@@ -493,6 +493,13 @@ class MonitorRunner:
             cand_text = candidate_reply.text if candidate_reply is not None else None
             if cand_text is not None:
                 safe_ok, safe_reason = self.rate_limiter.check_reply_content(cand_text)
+                if not safe_ok and self.generator is not None:
+                    rewrite_fn = getattr(self.generator, "rewrite_safe", None)
+                    if callable(rewrite_fn):
+                        rewritten = rewrite_fn(ctx, decision)
+                        if rewritten is not None and rewritten.text:
+                            cand_text = rewritten.text
+                            safe_ok, safe_reason = self.rate_limiter.check_reply_content(cand_text)
                 if not safe_ok:
                     self.store.mark_pending_status(candidate.fingerprint, "skipped", now=now)
                     self.store.record_reply_decision(

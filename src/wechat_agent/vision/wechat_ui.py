@@ -471,14 +471,19 @@ def verify_pasted_text(
     ocr_boxes: list[OcrBox],
     input_box: Box,
     expected_text: str,
+    *,
+    allow_upward_growth: bool = False,
 ) -> tuple[bool, str]:
-    """Verify pasted text inside the input region matches `expected_text` once and without duplication."""
-    # Allow upward box growth for multi-line pasted content while staying strictly above keyboard bottom.
+    """Verify pasted text inside `input_box` matches `expected_text` once and without duplication."""
+    # When callers already pass the freshly detected post-paste white input box, keep a tight
+    # margin (±0.015) so adjacent incoming chat bubbles immediately above never leak in.
+    # Only widen upward when falling back to a pre-paste single-line input box.
+    top_margin = 0.14 if allow_upward_growth else 0.015
     paste_region = Box.clamped(
-        input_box.left - 0.02,
-        max(0.18, input_box.top - 0.18),
-        input_box.right + 0.02,
-        min(0.72, input_box.bottom + 0.02),
+        input_box.left - 0.015,
+        max(0.18, input_box.top - top_margin),
+        input_box.right + 0.015,
+        min(0.72, input_box.bottom + 0.015),
     )
     items = [
         item

@@ -317,15 +317,22 @@ class SendMessageWorkflow:
             )
 
         focused_post = detect_keyboard_and_focused_input(post_obs.image_bytes, post_ocr)
-        active_input_box = focused.input_box
         if focused_post is not None:
-            active_input_box = Box.clamped(
-                min(focused.input_box.left, focused_post.input_box.left),
-                min(focused.input_box.top, focused_post.input_box.top),
-                max(focused.input_box.right, focused_post.input_box.right),
-                max(focused.input_box.bottom, focused_post.input_box.bottom),
+            active_input_box = focused_post.input_box
+            text_ok, observed_pasted = verify_pasted_text(
+                post_ocr,
+                active_input_box,
+                clean_text,
+                allow_upward_growth=False,
             )
-        text_ok, observed_pasted = verify_pasted_text(post_ocr, active_input_box, clean_text)
+        else:
+            active_input_box = focused.input_box
+            text_ok, observed_pasted = verify_pasted_text(
+                post_ocr,
+                active_input_box,
+                clean_text,
+                allow_upward_growth=True,
+            )
         if not text_ok:
             return report(
                 SendStatus.ABORTED_PASTE_VERIFY,

@@ -305,3 +305,59 @@ def test_llm_defaults_and_length_truncation_raises_and_fails_closed(monkeypatch)
     assert gate_res.should_reply is False
     assert gate_res.risk_score == 1.0
     assert "2048" in gate_res.reason
+
+
+def test_llm_generator_forbids_negative_sensitive_terms_and_rewrite_safe() -> None:
+    from wechat_agent.monitor.models import DecisionResult
+
+    class _StubLlm:
+        def __init__(self, responses: list[object]) -> None:
+            self._responses = list(responses)
+            self.calls: list[list[dict[str, str]]] = []
+
+        def chat_completion(self, messages, *, json_mode=False, temperature=None, max_tokens=None):
+            self.calls.append(messages)
+            nxt = self._responses.pop(0)
+            if isinstance(nxt, Exception):
+                raise nxt
+            return str(nxt)
+
+    ctx = _ctx("@运营助手 这款怎么下单团购？")
+    dec = DecisionResult(
+        should_reply=True,
+        intent="order_guide",
+        confidence=0.95,
+        risk_score=0.05,
+        reason="matched shopping duty",
+    )
+
+    llm = _StubLlm(
+        [
+            "请按群内官方团购链接或小程序下单，具体联系群主确认",
+            "SKIP",
+            LlmClientError("network error"),
+        ]
+    )
+    gen = LlmReplyGenerator(llm)
+
+    base_msgs = gen.build_messages(ctx, dec)
+    sys_prompt = base_msgs[0]["content"]
+    assert "红包、转账、打款、汇款、收款码、付款码" in sys_prompt
+    assert "不要私下转账" in sys_prompt
+    assert "按群内官方团购链接/小程序下单" in sys_prompt
+
+    rewrite_msgs = gen.build_rewrite_messages(ctx, dec)
+    assert "安全改写要求" in rewrite_msgs[1]["content"]
+    assert "不要提及任何资金、收付款、口令或验证类词汇" in rewrite_msgs[1]["content"]
+
+    hyb = HybridReplyGenerator(RuleTemplateGenerator([]), gen)
+    rewritten = hyb.rewrite_safe(ctx, dec)
+    assert rewritten is not None
+    assert rewritten.text == "请按群内官方团购链接或小程序下单，具体联系群主确认"
+    assert rewritten.raw.get("rewritten") is True
+
+    # SKIP and LlmClientError both return None cleanly
+    assert hyb.rewrite_safe(ctx, dec) is None
+    assert hyb.rewrite_safe(ctx, dec) is None
+    assert HybridReplyGenerator(RuleTemplateGenerator([]), None).rewrite_safe(ctx, dec) is None
+

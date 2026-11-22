@@ -630,3 +630,82 @@ def test_navigation_409_progressive_backoff_recovers_and_caps(tmp_path: Path) ->
     assert sleeps_fail == [0.8, 1.5, 2.2, 2.5, 3.0]
     assert not any(c[0] == "click_observed" for c in driver_fail.calls)
 
+
+def test_dry_run_4line_multiline_paste_with_adjacent_incoming_bubble_succeeds(tmp_path: Path) -> None:
+    expected_text = "@测试群友A 群里的特卖品按群内官方团购链接或小程序下单就行，找不到入口的话直接问群主确认。"
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+
+    collapsed_img = make_collapsed_chat_image(incoming_boxes=[Box(0.17, 0.72, 0.72, 0.79)])
+    ocr.register(
+        collapsed_img,
+        [
+            OcrBox("示例测试群(12)", Box(0.28, 0.06, 0.72, 0.09)),
+            OcrBox("测试群友A", Box(0.17, 0.695, 0.28, 0.715)),
+            OcrBox("@示例助手怎么团购下单？", Box(0.19, 0.735, 0.70, 0.765)),
+        ],
+    )
+
+    focused_empty_img = make_keyboard_chat_image(
+        blue_send=False,
+        with_caret=True,
+        incoming_boxes=[Box(0.17, 0.44, 0.72, 0.495)],
+    )
+    ocr.register(
+        focused_empty_img,
+        [
+            OcrBox("示例测试群(12)", Box(0.28, 0.06, 0.72, 0.09)),
+            OcrBox("测试群友A", Box(0.17, 0.418, 0.28, 0.435)),
+            OcrBox("@示例助手怎么团购下单？", Box(0.19, 0.455, 0.70, 0.482)),
+            OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+            OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+        ],
+    )
+
+    expanded_pasted_img = make_keyboard_chat_image(
+        blue_send=True,
+        with_caret=True,
+        input_box=Box(0.132, 0.456, 0.764, 0.576),
+        incoming_boxes=[Box(0.17, 0.375, 0.72, 0.425)],
+    )
+    ocr.register(
+        expanded_pasted_img,
+        [
+            OcrBox("示例测试群(12)", Box(0.28, 0.06, 0.72, 0.09)),
+            OcrBox("17:15", Box(0.45, 0.32, 0.55, 0.34)),
+            OcrBox("测试群友A", Box(0.17, 0.355, 0.28, 0.372)),
+            OcrBox("@示例助手怎么团购下单？", Box(0.19, 0.390, 0.70, 0.415)),
+            OcrBox("门", Box(0.050, 0.465, 0.082, 0.478)),
+            OcrBox("@测试群友A 群里的特卖品按", Box(0.164, 0.467, 0.708, 0.487)),
+            OcrBox("群内官方团购链接或小程序下", Box(0.164, 0.494, 0.706, 0.512)),
+            OcrBox("单就行，找不到入口的话直接", Box(0.160, 0.517, 0.710, 0.537)),
+            OcrBox("问群主确认。", Box(0.156, 0.541, 0.422, 0.567)),
+            OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+            OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+        ],
+    )
+
+    driver.observe_queue = [
+        Observation(screen_id="scr-init", image_bytes=collapsed_img),
+        Observation(screen_id="scr-pasted", image_bytes=expanded_pasted_img),
+    ]
+    driver.click_handler = lambda *args: ClickResult(
+        screen_id="scr-kb",
+        clicked=True,
+        command_acknowledged=True,
+        image_bytes=focused_empty_img,
+    )
+    driver.paste_handler = lambda text, tb, et: PasteFlowResult(
+        ok=True,
+        cmd_v_sent=1,
+        phase="completed",
+        effect_verified=True,
+        recovery_state=PasteRecoveryState.COMPLETED,
+        next_action="ready",
+    )
+
+    cfg = _config(tmp_path, allowed_targets=("示例测试群",), allow_group_count=True)
+    rep = SendMessageWorkflow(driver, ocr, cfg).run("示例测试群", expected_text, send=False)
+    assert rep.status == SendStatus.DRY_RUN_READY
+    assert "post_paste_verified" in rep.steps
+

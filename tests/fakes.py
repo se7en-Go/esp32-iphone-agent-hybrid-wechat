@@ -100,16 +100,24 @@ def make_keyboard_chat_image(
     with_side_toolbar_icons: bool = False,
     outgoing_boxes: list[Box] | None = None,
     incoming_boxes: list[Box] | None = None,
+    input_box: Box | None = None,
 ) -> bytes:
     img = Image.new("RGB", (w, h), (237, 237, 237))
     draw = ImageDraw.Draw(img)
+    pill = input_box or Box(0.132, 0.528, 0.764, 0.576)
+    toolbar_top = min(0.50, max(0.20, pill.top - 0.014))
     # Focused toolbar directly above keyboard (keyboard starts ~0.58)
-    draw.rectangle([0, int(0.50 * h), w, int(0.58 * h)], fill=(245, 245, 245))
+    draw.rectangle([0, int(toolbar_top * h), w, int(0.58 * h)], fill=(245, 245, 245))
     # Focused white input box (matches real WeChat 0.132..0.764)
-    draw.rounded_rectangle(_box_px(Box(0.132, 0.528, 0.764, 0.576), w, h), radius=8, fill=(255, 255, 255))
+    draw.rounded_rectangle(_box_px(pill, w, h), radius=8, fill=(255, 255, 255))
     if with_caret:
-        # Bright WeChat green caret bar near left side of input box
-        draw.rectangle(_box_px(Box(0.155, 0.535, 0.163, 0.568), w, h), fill=(7, 193, 96))
+        # Bright WeChat green caret bar near left side of bottom line inside input box
+        caret_top = max(pill.top + 0.006, pill.bottom - 0.041)
+        caret_bottom = max(caret_top + 0.015, pill.bottom - 0.008)
+        draw.rectangle(
+            _box_px(Box(pill.left + 0.023, caret_top, pill.left + 0.031, caret_bottom), w, h),
+            fill=(7, 193, 96),
+        )
     if with_right_mic_icon:
         # Interior dark grey microphone icon inside right side of white input box (~0.692..0.720)
         draw.rounded_rectangle(_box_px(Box(0.694, 0.536, 0.718, 0.568), w, h), radius=4, fill=(77, 75, 78))

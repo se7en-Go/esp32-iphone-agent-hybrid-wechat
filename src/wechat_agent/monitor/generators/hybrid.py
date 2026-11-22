@@ -27,3 +27,9 @@ class HybridReplyGenerator:
         if self.llm_generator is not None:
             return self.llm_generator.generate(ctx, decision)
         return None
+
+    def rewrite_safe(self, ctx: DecisionContext, decision: DecisionResult) -> GeneratedReply | None:
+        """Delegate one-shot neutral safety rewrite to the LLM generator when configured."""
+        if self.llm_generator is not None:
+            return self.llm_generator.rewrite_safe(ctx, decision)
+        return None

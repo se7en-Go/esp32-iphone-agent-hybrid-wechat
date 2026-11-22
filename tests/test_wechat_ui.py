@@ -262,3 +262,44 @@ def test_canonical_group_title_punctuation_and_parenthesized_suffix_matching() -
     assert 0.28 <= row.center[1] <= 0.34
 
 
+def test_verify_pasted_text_4line_draft_strictly_excludes_adjacent_chat_bubbles_and_expand_icon() -> None:
+    expected_text = "@测试群友A 群里的特卖品按群内官方团购链接或小程序下单就行，找不到入口的话直接问群主确认。"
+    expanded_pill = Box(0.132, 0.456, 0.764, 0.576)
+    img = make_keyboard_chat_image(
+        blue_send=True,
+        with_caret=True,
+        input_box=expanded_pill,
+        incoming_boxes=[Box(0.17, 0.375, 0.72, 0.425)],
+    )
+    ocr_boxes = [
+        OcrBox("示例测试群(12)", Box(0.28, 0.06, 0.72, 0.09)),
+        OcrBox("17:15", Box(0.45, 0.32, 0.55, 0.34)),
+        OcrBox("测试群友A", Box(0.17, 0.355, 0.28, 0.372)),
+        OcrBox("@示例助手怎么团购下单？", Box(0.19, 0.390, 0.70, 0.415)),
+        OcrBox("门", Box(0.050, 0.465, 0.082, 0.478)),  # left expand icon outside pill
+        OcrBox("@测试群友A 群里的特卖品按", Box(0.164, 0.467, 0.708, 0.487)),
+        OcrBox("群内官方团购链接或小程序下", Box(0.164, 0.494, 0.706, 0.512)),
+        OcrBox("单就行，找不到入口的话直接", Box(0.160, 0.517, 0.710, 0.537)),
+        OcrBox("问群主确认。", Box(0.156, 0.541, 0.422, 0.567)),
+        OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+        OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+    ]
+
+    layout = detect_keyboard_and_focused_input(img, ocr_boxes)
+    assert layout is not None
+    assert 0.448 <= layout.input_box.top <= 0.464
+    assert 0.568 <= layout.input_box.bottom <= 0.584
+
+    ok, obs = verify_pasted_text(ocr_boxes, layout.input_box, expected_text)
+    assert ok is True
+    assert "17:15" not in obs
+    assert "测试群友A" in obs
+    assert "@示例助手" not in obs
+    assert "门" not in obs
+
+    # Duplicated 4-line paste must still be rejected
+    dup_boxes = ocr_boxes + [OcrBox("问群主确认。", Box(0.430, 0.541, 0.690, 0.567))]
+    ok_dup, _ = verify_pasted_text(dup_boxes, layout.input_box, expected_text)
+    assert ok_dup is False
+
+

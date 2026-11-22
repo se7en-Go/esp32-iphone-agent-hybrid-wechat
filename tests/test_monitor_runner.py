@@ -858,3 +858,120 @@ def test_short_interval_burst_discontinuity_recovers_unseen_tail_and_mentions(tm
         assert "discontinuity" in r2.message
 
 
+def test_forbidden_reply_auto_rewrite_once_passes_or_blocks(tmp_path: Path) -> None:
+    from wechat_agent.monitor.generators import LlmReplyGenerator
+
+    class _SeqLlm:
+        def __init__(self, responses: list[str]) -> None:
+            self._responses = list(responses)
+            self.calls: list[list[dict[str, str]]] = []
+
+        def chat_completion(self, messages, *, json_mode=False, temperature=None, max_tokens=None):
+            self.calls.append(messages)
+            return self._responses.pop(0)
+
+    def _ok_decision() -> str:
+        return json.dumps(
+            {
+                "should_reply": True,
+                "intent": "order_inquiry",
+                "confidence": 0.96,
+                "risk_score": 0.05,
+                "reason": "matched shopping duty",
+            }
+        )
+
+    # Case 1: first draft triggers negative sensitive term ("不要私下转账"), single rewrite succeeds
+    llm_pass = _SeqLlm(
+        [
+            _ok_decision(),
+            "请按链接下单，不要私下转账",
+            "请按群内官方团购链接或小程序下单，具体价格可看群公告或联系群主确认",
+        ]
+    )
+    driver1 = FakePhoneDriver()
+    ocr1 = MockOcrEngine()
+    f0 = _group_frame(ocr1, header="示例测试群(12)", incoming=[])
+    f1 = _group_frame(
+        ocr1,
+        header="示例测试群(12)",
+        incoming=[("测试群友A", "@运营助手 怎么下单团购？", Box(0.14, 0.25, 0.65, 0.31))],
+    )
+    driver1.observe_queue = [Observation("s0", f0), Observation("s1", f1)]
+    cfg1 = _monitor_cfg(tmp_path / "c1", mode=MonitorMode.DRY_RUN, group_name="示例测试群")
+    with MonitorStore(cfg1.state_db_path, cfg1.audit_log_path) as store1:
+        runner1 = MonitorRunner(
+            driver1,
+            ocr1,
+            cfg1,
+            store1,
+            LlmIntentGate(llm_pass),
+            HybridReplyGenerator(RuleTemplateGenerator([]), LlmReplyGenerator(llm_pass)),
+            clock=lambda: 3000.0,
+        )
+        assert runner1.run_tick(0).outcome == TickOutcome.BASELINE_SEEDED
+        res1 = runner1.run_tick(1)
+        assert res1.outcome == TickOutcome.DRY_RUN_LOGGED
+        assert res1.reply_text == "请按群内官方团购链接或小程序下单，具体价格可看群公告或联系群主确认"
+        assert len(llm_pass.calls) == 3
+        assert "安全改写要求" in llm_pass.calls[2][1]["content"]
+        assert "转账" not in llm_pass.calls[2][1]["content"]
+
+    # Case 2: rewrite still contains forbidden word -> blocks cleanly without a 2nd retry
+    llm_fail = _SeqLlm(
+        [
+            _ok_decision(),
+            "请勿私下转账",
+            "切勿发红包给陌生人",
+        ]
+    )
+    driver2 = FakePhoneDriver()
+    driver2.observe_queue = [Observation("s0", f0), Observation("s1", f1)]
+    cfg2 = _monitor_cfg(tmp_path / "c2", mode=MonitorMode.DRY_RUN, group_name="示例测试群")
+    with MonitorStore(cfg2.state_db_path, cfg2.audit_log_path) as store2:
+        runner2 = MonitorRunner(
+            driver2,
+            ocr1,
+            cfg2,
+            store2,
+            LlmIntentGate(llm_fail),
+            HybridReplyGenerator(RuleTemplateGenerator([]), LlmReplyGenerator(llm_fail)),
+            clock=lambda: 4000.0,
+        )
+        assert runner2.run_tick(0).outcome == TickOutcome.BASELINE_SEEDED
+        res2 = runner2.run_tick(1)
+        assert res2.outcome == TickOutcome.SKIPPED_FORBIDDEN_REPLY
+        assert res2.reply_text is None
+        assert len(llm_fail.calls) == 3
+        row2 = store2._conn.execute("SELECT status, reply_text FROM reply_history ORDER BY id DESC LIMIT 1").fetchone()
+        assert tuple(row2) == ("skipped_forbidden_reply", None)
+        q2 = store2._conn.execute("SELECT status FROM pending_queue ORDER BY id DESC LIMIT 1").fetchone()
+        assert q2[0] == "skipped"
+
+    # Case 3: rewrite returns SKIP (None) -> unsafe original draft is never used and still lands SKIPPED_FORBIDDEN_REPLY
+    llm_skip = _SeqLlm(
+        [
+            _ok_decision(),
+            "不要扫收款码",
+            "SKIP",
+        ]
+    )
+    driver3 = FakePhoneDriver()
+    driver3.observe_queue = [Observation("s0", f0), Observation("s1", f1)]
+    cfg3 = _monitor_cfg(tmp_path / "c3", mode=MonitorMode.DRY_RUN, group_name="示例测试群")
+    with MonitorStore(cfg3.state_db_path, cfg3.audit_log_path) as store3:
+        runner3 = MonitorRunner(
+            driver3,
+            ocr1,
+            cfg3,
+            store3,
+            LlmIntentGate(llm_skip),
+            HybridReplyGenerator(RuleTemplateGenerator([]), LlmReplyGenerator(llm_skip)),
+            clock=lambda: 5000.0,
+        )
+        assert runner3.run_tick(0).outcome == TickOutcome.BASELINE_SEEDED
+        res3 = runner3.run_tick(1)
+        assert res3.outcome == TickOutcome.SKIPPED_FORBIDDEN_REPLY
+        assert res3.reply_text is None
+        assert len(llm_skip.calls) == 3
+
