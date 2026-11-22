@@ -107,8 +107,9 @@ def test_mentions_and_fingerprint_stability() -> None:
 
 
 def test_lock_screen_detection() -> None:
-    from PIL import Image
     import io
+
+    from PIL import Image
 
     black = Image.new("RGB", (120, 260), (0, 0, 0))
     buf = io.BytesIO()
@@ -188,6 +189,7 @@ def test_extractor_merges_multiline_wrapped_self_green_bubble() -> None:
 
 def test_extractor_ignores_sender_touching_white_sticker_and_filters_white_bg_sticker_caption() -> None:
     import io
+
     from PIL import Image, ImageDraw
 
     w, h = 480, 1040
@@ -245,11 +247,43 @@ def test_extractor_ignores_sender_touching_white_sticker_and_filters_white_bg_st
 
 def test_merge_same_sender_bursts_behavior() -> None:
     g = "示例测试群"
-    m1 = ExtractedMessage(g, MessageRole.INCOMING, "请问营业时间", sender="测试群友A", mentioned_self=False, fingerprint="f1", captured_at=100.0)
-    m2 = ExtractedMessage(g, MessageRole.INCOMING, "@示例助手", sender="测试群友A", mentioned_self=True, fingerprint="f2", captured_at=103.0)
-    m3 = ExtractedMessage(g, MessageRole.INCOMING, "有人在吗", sender="测试群友B", mentioned_self=False, fingerprint="f3", captured_at=104.0)
+    m1 = ExtractedMessage(
+        g,
+        MessageRole.INCOMING,
+        "请问营业时间",
+        sender="测试群友A",
+        mentioned_self=False,
+        fingerprint="f1",
+        captured_at=100.0,
+    )
+    m2 = ExtractedMessage(
+        g,
+        MessageRole.INCOMING,
+        "@示例助手",
+        sender="测试群友A",
+        mentioned_self=True,
+        fingerprint="f2",
+        captured_at=103.0,
+    )
+    m3 = ExtractedMessage(
+        g,
+        MessageRole.INCOMING,
+        "有人在吗",
+        sender="测试群友B",
+        mentioned_self=False,
+        fingerprint="f3",
+        captured_at=104.0,
+    )
     # > 5s gap must NOT merge even for same sender
-    m4 = ExtractedMessage(g, MessageRole.INCOMING, "补充一句", sender="测试群友B", mentioned_self=False, fingerprint="f4", captured_at=112.0)
+    m4 = ExtractedMessage(
+        g,
+        MessageRole.INCOMING,
+        "补充一句",
+        sender="测试群友B",
+        mentioned_self=False,
+        fingerprint="f4",
+        captured_at=112.0,
+    )
     # Empty sender (hidden group nicknames) must NEVER merge across different users' bubbles
     e1 = ExtractedMessage(g, MessageRole.INCOMING, "在吗", sender="", fingerprint="e1", captured_at=120.0)
     e2 = ExtractedMessage(g, MessageRole.INCOMING, "价格多少", sender="", fingerprint="e2", captured_at=121.0)

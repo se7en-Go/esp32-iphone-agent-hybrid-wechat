@@ -160,19 +160,23 @@ def _cmd_doctor(cfg: WeChatSendConfig) -> int:
         return 2
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if (result["base_ready"] and result["staged_v1_ready"] and result["wechat_send_mounted"]) else 1
+    return 0 if (result["base_ready"] and result["staged_v1_ready"] and result["wechat_send_mounted"]) else 2
 
 
 def _cmd_send(args: argparse.Namespace) -> int:
-    cfg = load_config(
-        args.config,
-        allowed_targets_override=args.allow_targets,
-        skill_name_override=args.skill,
-        ocr_backend_override=args.ocr,
-        cli_override=args.cli,
-        url_override=args.url,
-    )
-    text = args.text if args.text is not None else Path(args.text_file).read_text(encoding="utf-8")
+    try:
+        cfg = load_config(
+            args.config,
+            allowed_targets_override=args.allow_targets,
+            skill_name_override=args.skill,
+            ocr_backend_override=args.ocr,
+            cli_override=args.cli,
+            url_override=args.url,
+        )
+        text = args.text if args.text is not None else Path(args.text_file).read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
     driver = IphoneAgentCliDriver(
         cfg.iphone_agent_cli,
         cfg.iphone_agent_url,
@@ -187,16 +191,30 @@ def _cmd_send(args: argparse.Namespace) -> int:
 
 
 def _cmd_monitor(args: argparse.Namespace) -> int:
-    cfg = load_monitor_config(
-        args.config,
-        group_override=args.group,
-        mode_override=args.mode,
-        allow_live_send_override=bool(args.allow_live_send),
-        gate_override=args.gate,
-        rules_override=args.rules,
-        cli_override=args.cli,
-        url_override=args.url,
-    )
+    if args.max_ticks is not None and args.max_ticks <= 0:
+        print(
+            json.dumps(
+                {"ok": False, "error": f"--max-ticks must be a positive integer, got {args.max_ticks}"},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        cfg = load_monitor_config(
+            args.config,
+            group_override=args.group,
+            mode_override=args.mode,
+            allow_live_send_override=bool(args.allow_live_send),
+            gate_override=args.gate,
+            rules_override=args.rules,
+            cli_override=args.cli,
+            url_override=args.url,
+        )
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
     rules = load_rules_yaml(cfg.rules_path) if cfg.rules_path else []
     llm_client = OpenAICompatibleLlmClient(cfg.llm) if cfg.llm.is_ready else None
 

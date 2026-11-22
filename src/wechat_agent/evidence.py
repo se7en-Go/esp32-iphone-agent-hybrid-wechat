@@ -6,6 +6,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -115,3 +117,46 @@ class RunEvidence:
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
             handle.write(line)
         os.chmod(self._events_path, 0o600)
+
+
+def prune_evidence_runs(
+    root: Path,
+    *,
+    max_age_seconds: float = 7 * 86400.0,
+    max_runs: int = 200,
+    now: float | None = None,
+) -> int:
+    """Prune old `RunEvidence` directories under `root` by age TTL and max directory count."""
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return 0
+    ts = time.time() if now is None else float(now)
+    cutoff = ts - max(0.0, float(max_age_seconds))
+    entries: list[tuple[float, Path]] = []
+    for child in root_path.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            mtime = child.stat().st_mtime
+        except OSError:
+            continue
+        entries.append((mtime, child))
+
+    # Sort oldest -> newest so age pruning and max_runs trimming remove oldest runs first.
+    entries.sort(key=lambda pair: (pair[0], pair[1].name))
+    removed = 0
+    kept: list[tuple[float, Path]] = []
+    for mtime, child in entries:
+        if mtime < cutoff:
+            shutil.rmtree(child, ignore_errors=True)
+            removed += 1
+        else:
+            kept.append((mtime, child))
+
+    cap = max(0, int(max_runs))
+    if len(kept) > cap:
+        excess = len(kept) - cap
+        for _, child in kept[:excess]:
+            shutil.rmtree(child, ignore_errors=True)
+            removed += 1
+    return removed

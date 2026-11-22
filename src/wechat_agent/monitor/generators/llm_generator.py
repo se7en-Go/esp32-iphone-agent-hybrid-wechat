@@ -43,7 +43,7 @@ class LlmReplyGenerator:
             f"群名称：{ctx.group_title}\n"
             + role_block
             + f"已识别意图：{decision.intent}（理由：{decision.reason}）\n"
-            + f"最近上下文：\n"
+            + "最近上下文：\n"
             + "\n".join(history_lines)
             + f"\n\n待回复来信：\n[对方/{sender}]: {ctx.message.text}"
         )
@@ -57,7 +57,8 @@ class LlmReplyGenerator:
         rewrite_note = (
             "\n\n安全改写要求：上一版草稿触发了群聊内容安全词校验，请重新生成一句完全中性的简短回复。"
             "不要提及任何资金、收付款、口令或验证类词汇（哪怕是否定或提醒语气也不得出现），不要包含手机号或绝对化承诺；"
-            "涉及下单方式请统一使用「按群内官方团购链接/小程序下单或联系群主确认」这类中性表述。若无法满足，仅输出 SKIP。"
+            "涉及下单方式请统一使用「按群内官方团购链接/小程序下单或联系群主确认」这类中性表述。"
+            "若无法满足，仅输出 SKIP。"
         )
         return [
             messages[0],

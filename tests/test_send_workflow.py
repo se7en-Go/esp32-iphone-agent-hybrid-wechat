@@ -123,7 +123,13 @@ def test_preflight_blocks_when_unready_or_skill_unmounted(tmp_path: Path) -> Non
     assert "HIDAGENT_SKILLS" in rep.message
 
     tripped = FakePhoneDriver(
-        status_payload={"device": True, "screen": True, "calibrated": True, "ready": True, "guard": {"tripped": True, "reason": "风控"}}
+        status_payload={
+            "device": True,
+            "screen": True,
+            "calibrated": True,
+            "ready": True,
+            "guard": {"tripped": True, "reason": "风控"},
+        }
     )
     rep2 = SendMessageWorkflow(tripped, MockOcrEngine(), _config(tmp_path)).run("文件传输助手", "hello")
     assert rep2.status == SendStatus.ABORTED_PREFLIGHT
@@ -598,7 +604,12 @@ def test_navigation_409_progressive_backoff_recovers_and_caps(tmp_path: Path) ->
     driver_ok.point_handler = handle_point_ok
     click_seq_ok = [
         ClickResult(screen_id="scr-chat", clicked=True, command_acknowledged=True, image_bytes=frames_ok["collapsed"]),
-        ClickResult(screen_id="scr-kb", clicked=True, command_acknowledged=True, image_bytes=frames_ok["focused_empty"]),
+        ClickResult(
+            screen_id="scr-kb",
+            clicked=True,
+            command_acknowledged=True,
+            image_bytes=frames_ok["focused_empty"],
+        ),
     ]
     driver_ok.click_handler = lambda *args: click_seq_ok.pop(0)
 

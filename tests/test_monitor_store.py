@@ -186,10 +186,18 @@ def test_store_viewport_event_seq_recent_content_and_legacy_migration(tmp_path: 
 def test_store_pending_queue_burst_merge_priority_and_ttl_expiry(tmp_path: Path) -> None:
     db_path = tmp_path / "state" / "pq.db"
     g = "示例分享•测试3群（198）"
-    m_normal = ExtractedMessage(g, MessageRole.INCOMING, "价格多少", sender="测试群友A", mentioned_self=False, fingerprint="pq-1")
-    m_burst = ExtractedMessage(g, MessageRole.INCOMING, "@示例助手", sender="测试群友A", mentioned_self=True, fingerprint="pq-2")
-    m_other = ExtractedMessage(g, MessageRole.INCOMING, "请问活动规则", sender="测试群友B", mentioned_self=False, fingerprint="pq-3")
-    m_other_mention = ExtractedMessage(g, MessageRole.INCOMING, "@示例助手 帮查一下", sender="测试群友C", mentioned_self=True, fingerprint="pq-4")
+    m_normal = ExtractedMessage(
+        g, MessageRole.INCOMING, "价格多少", sender="测试群友A", mentioned_self=False, fingerprint="pq-1"
+    )
+    m_burst = ExtractedMessage(
+        g, MessageRole.INCOMING, "@示例助手", sender="测试群友A", mentioned_self=True, fingerprint="pq-2"
+    )
+    m_other = ExtractedMessage(
+        g, MessageRole.INCOMING, "请问活动规则", sender="测试群友B", mentioned_self=False, fingerprint="pq-3"
+    )
+    m_other_mention = ExtractedMessage(
+        g, MessageRole.INCOMING, "@示例助手 帮查一下", sender="测试群友C", mentioned_self=True, fingerprint="pq-4"
+    )
 
     with MonitorStore(db_path) as store:
         fp_a = store.enqueue_pending(m_normal, ttl_seconds=180.0, burst_merge_window_seconds=5.0, now=1000.0)

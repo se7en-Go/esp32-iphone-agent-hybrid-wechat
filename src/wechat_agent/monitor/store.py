@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,11 @@ def _ensure_private_parent(path: Path) -> None:
     os.chmod(path.parent, 0o700)
 
 
+def _content_hash(sender: str, text: str) -> str:
+    payload = f"{normalize_text(sender)}\x1f{_canonical_for_hash(text)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
 class MonitorStore:
     """Persistent state store for deduplication, idempotent reply locking, and rate-limit history."""
 
@@ -51,10 +57,14 @@ class MonitorStore:
         audit_log_path: Path | None = None,
         *,
         acquire_lock: bool = True,
+        audit_max_bytes: int = 10 * 1024 * 1024,
+        audit_backup_count: int = 5,
     ) -> None:
         self.db_path = Path(db_path)
         self.lock_path = self.db_path.with_name(f"{self.db_path.name}.lock")
         self.audit_log_path = Path(audit_log_path) if audit_log_path is not None else None
+        self.audit_max_bytes = max(1024, int(audit_max_bytes))
+        self.audit_backup_count = max(1, int(audit_backup_count))
         self._lock_fd: int | None = None
         self._closed = False
         _ensure_private_parent(self.db_path)
@@ -124,12 +134,32 @@ class MonitorStore:
                     role TEXT NOT NULL,
                     sender TEXT NOT NULL,
                     text TEXT NOT NULL,
+                    content_hash TEXT NOT NULL DEFAULT '',
                     is_baseline INTEGER NOT NULL DEFAULT 0,
                     first_seen_at REAL NOT NULL,
                     last_seen_at REAL NOT NULL
                 )
                 """
             )
+            seen_cols = {
+                str(r["name"])
+                for r in self._conn.execute("PRAGMA table_info(seen_messages)").fetchall()
+            }
+            if "content_hash" not in seen_cols:
+                self._conn.execute(
+                    "ALTER TABLE seen_messages ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+                )
+            missing_hashes = self._conn.execute(
+                "SELECT id, sender, text FROM seen_messages WHERE content_hash = ''"
+            ).fetchall()
+            if missing_hashes:
+                self._conn.executemany(
+                    "UPDATE seen_messages SET content_hash = ? WHERE id = ?",
+                    [
+                        (_content_hash(str(r["sender"] or ""), str(r["text"] or "")), int(r["id"]))
+                        for r in missing_hashes
+                    ],
+                )
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS reply_history (
@@ -202,6 +232,10 @@ class MonitorStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_seen_group_time ON seen_messages(group_title, id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_seen_group_role_hash_time "
+                "ON seen_messages(group_title, role, content_hash, last_seen_at)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_send_events_time ON send_events(sent_at, group_title)"
@@ -342,22 +376,18 @@ class MonitorStore:
         *,
         since_ts: float,
     ) -> bool:
-        """Check whether `(role, sender, text)` was recently recorded in `seen_messages`."""
+        """Check whether `(role, sender, text)` was recently recorded using the SQL content_hash index."""
         norm_group = canonicalize_chat_title(group_title)
-        norm_sender = normalize_text(sender)
-        canon_text = _canonical_for_hash(text)
-        rows = self._conn.execute(
+        chash = _content_hash(sender, text)
+        row = self._conn.execute(
             """
-            SELECT sender, text FROM seen_messages
-            WHERE group_title = ? AND role = ? AND last_seen_at >= ?
+            SELECT 1 FROM seen_messages
+            WHERE group_title = ? AND role = ? AND content_hash = ? AND last_seen_at >= ?
+            LIMIT 1
             """,
-            (norm_group, role.value, float(since_ts)),
-        ).fetchall()
-        return any(
-            normalize_text(str(r["sender"] or "")) == norm_sender
-            and _canonical_for_hash(str(r["text"] or "")) == canon_text
-            for r in rows
-        )
+            (norm_group, role.value, chash, float(since_ts)),
+        ).fetchone()
+        return row is not None
 
     def has_seen(self, fingerprint: str) -> bool:
         row = self._conn.execute(
@@ -375,11 +405,12 @@ class MonitorStore:
     ) -> bool:
         norm_group = canonicalize_chat_title(msg.group_title)
         self._ensure_group_row(norm_group)
+        chash = _content_hash(msg.sender, msg.text)
         cur = self._conn.execute(
             """
             INSERT OR IGNORE INTO seen_messages
-                (fingerprint, group_title, role, sender, text, is_baseline, first_seen_at, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (fingerprint, group_title, role, sender, text, content_hash, is_baseline, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 msg.fingerprint,
@@ -387,6 +418,7 @@ class MonitorStore:
                 msg.role.value,
                 msg.sender,
                 msg.text,
+                chash,
                 1 if is_baseline else 0,
                 ts,
                 ts,
@@ -882,10 +914,112 @@ class MonitorStore:
                 (status, ts, fingerprint),
             )
 
+    def prune_storage(
+        self,
+        *,
+        now: float | None = None,
+        seen_ttl_seconds: float = 14 * 86400.0,
+        reply_ttl_seconds: float = 30 * 86400.0,
+        send_events_ttl_seconds: float = 30 * 86400.0,
+        pending_ttl_seconds: float = 7 * 86400.0,
+        max_rows_per_table: int = 50_000,
+    ) -> dict[str, int]:
+        """Enforce TTL and bounded row-count retention across all 4 growing SQLite tables."""
+        ts = time.time() if now is None else float(now)
+        cap = max(1, int(max_rows_per_table))
+        deleted = {"seen_messages": 0, "reply_history": 0, "send_events": 0, "pending_queue": 0}
+        with self._conn:
+            c1 = self._conn.execute(
+                "DELETE FROM seen_messages WHERE last_seen_at < ?",
+                (ts - max(0.0, float(seen_ttl_seconds)),),
+            )
+            deleted["seen_messages"] += int(c1.rowcount or 0)
+            c1_cap = self._conn.execute(
+                """
+                DELETE FROM seen_messages
+                WHERE id NOT IN (SELECT id FROM seen_messages ORDER BY id DESC LIMIT ?)
+                """,
+                (cap,),
+            )
+            deleted["seen_messages"] += int(c1_cap.rowcount or 0)
+
+            c2 = self._conn.execute(
+                "DELETE FROM reply_history WHERE created_at < ?",
+                (ts - max(0.0, float(reply_ttl_seconds)),),
+            )
+            deleted["reply_history"] += int(c2.rowcount or 0)
+            c2_cap = self._conn.execute(
+                """
+                DELETE FROM reply_history
+                WHERE id NOT IN (SELECT id FROM reply_history ORDER BY id DESC LIMIT ?)
+                """,
+                (cap,),
+            )
+            deleted["reply_history"] += int(c2_cap.rowcount or 0)
+
+            c3 = self._conn.execute(
+                "DELETE FROM send_events WHERE sent_at < ?",
+                (ts - max(0.0, float(send_events_ttl_seconds)),),
+            )
+            deleted["send_events"] += int(c3.rowcount or 0)
+            c3_cap = self._conn.execute(
+                """
+                DELETE FROM send_events
+                WHERE id NOT IN (SELECT id FROM send_events ORDER BY id DESC LIMIT ?)
+                """,
+                (cap,),
+            )
+            deleted["send_events"] += int(c3_cap.rowcount or 0)
+
+            # Never delete active 'pending' queue items; prune only settled/expired rows.
+            c4 = self._conn.execute(
+                "DELETE FROM pending_queue WHERE status != 'pending' AND updated_at < ?",
+                (ts - max(0.0, float(pending_ttl_seconds)),),
+            )
+            deleted["pending_queue"] += int(c4.rowcount or 0)
+            c4_cap = self._conn.execute(
+                """
+                DELETE FROM pending_queue
+                WHERE status != 'pending'
+                  AND id NOT IN (
+                      SELECT id FROM pending_queue WHERE status != 'pending' ORDER BY id DESC LIMIT ?
+                  )
+                """,
+                (cap,),
+            )
+            deleted["pending_queue"] += int(c4_cap.rowcount or 0)
+        return deleted
+
+    def _rotate_audit_if_needed(self) -> None:
+        if self.audit_log_path is None or not self.audit_log_path.is_file():
+            return
+        try:
+            size = self.audit_log_path.stat().st_size
+        except OSError:
+            return
+        if size < self.audit_max_bytes:
+            return
+        base = self.audit_log_path
+        for idx in range(self.audit_backup_count, 0, -1):
+            src = base if idx == 1 else base.with_name(f"{base.name}.{idx - 1}")
+            dst = base.with_name(f"{base.name}.{idx}")
+            if idx == self.audit_backup_count and dst.exists():
+                try:
+                    dst.unlink()
+                except OSError:
+                    pass
+            if src.exists():
+                os.replace(src, dst)
+                try:
+                    os.chmod(dst, 0o600)
+                except OSError:
+                    pass
+
     def append_audit(self, event: dict[str, Any]) -> None:
         if self.audit_log_path is None:
             return
         _ensure_private_parent(self.audit_log_path)
+        self._rotate_audit_if_needed()
         record = {
             "ts": datetime.now().isoformat(timespec="milliseconds"),
             **redact_dict(event),

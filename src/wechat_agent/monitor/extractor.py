@@ -246,8 +246,11 @@ def mentions_any_alias(text: str, self_aliases: tuple[str, ...] | list[str]) -> 
 def _decode_rgb(image_bytes: bytes) -> np.ndarray | None:
     if not image_bytes:
         return None
-    with Image.open(io.BytesIO(image_bytes)) as img:
-        return np.asarray(img.convert("RGB"))
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            return np.asarray(img.convert("RGB"))
+    except (OSError, ValueError):
+        return None
 
 
 def _norm_box_to_pixels(box: Box, width: int, height: int) -> tuple[int, int, int, int]:

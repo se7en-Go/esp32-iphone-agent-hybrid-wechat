@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import re
@@ -30,17 +31,20 @@ _HTTP_STATUS_RE = re.compile(r"\bHTTP\s+(\d{3})\b")
 
 def _extract_image_bytes(payload: dict[str, Any], image_output: Path | None) -> tuple[bytes, str | None]:
     image_path = payload.get("image_path")
-    if image_path:
-        path = Path(str(image_path))
-        if path.is_file():
-            os.chmod(path, 0o600)
-            return path.read_bytes(), str(path)
-    if image_output is not None and image_output.is_file():
-        os.chmod(image_output, 0o600)
-        return image_output.read_bytes(), str(image_output)
-    b64 = payload.get("image_base64")
-    if isinstance(b64, str) and b64:
-        return base64.b64decode(b64), None
+    try:
+        if image_path:
+            path = Path(str(image_path))
+            if path.is_file():
+                os.chmod(path, 0o600)
+                return path.read_bytes(), str(path)
+        if image_output is not None and image_output.is_file():
+            os.chmod(image_output, 0o600)
+            return image_output.read_bytes(), str(image_output)
+        b64 = payload.get("image_base64")
+        if isinstance(b64, str) and b64:
+            return base64.b64decode(b64), None
+    except (OSError, ValueError, binascii.Error) as exc:
+        raise DriverError(f"Failed to read/decode screenshot payload from iphone-agent: {exc}") from exc
     return b"", str(image_path) if image_path else None
 
 
@@ -99,6 +103,11 @@ class IphoneAgentCliDriver:
                 f"iphone-agent CLI timed out after {effective_timeout}s: {' '.join(args)}",
                 command=cmd,
             ) from exc
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise DriverError(
+                f"iphone-agent CLI execution/decoding error: {exc}",
+                command=cmd,
+            ) from exc
 
     def _run_json(self, args: list[str]) -> dict[str, Any]:
         proc = self._run_raw(args)
@@ -119,8 +128,16 @@ class IphoneAgentCliDriver:
             or proc.stdout.strip()
             or f"CLI exited with code {proc.returncode}"
         )
-        match = _HTTP_STATUS_RE.search(detail)
-        status_code = int(match.group(1)) if match else None
+        # Prefer structured status_code / http_status field from JSON payload over text regex matching.
+        status_code: int | None = None
+        for key in ("status_code", "http_status", "status"):
+            raw_code = err_payload.get(key)
+            if isinstance(raw_code, int) and not isinstance(raw_code, bool) and 100 <= raw_code <= 599:
+                status_code = raw_code
+                break
+        if status_code is None:
+            match = _HTTP_STATUS_RE.search(detail)
+            status_code = int(match.group(1)) if match else None
         if status_code == 409:
             raise ConflictError(
                 detail,

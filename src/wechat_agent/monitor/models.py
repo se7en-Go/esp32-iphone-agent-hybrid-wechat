@@ -123,6 +123,7 @@ class TickOutcome(str, Enum):
     PAUSED_LEFT_GROUP = "paused_left_group"
     PAUSED_LOCK_SCREEN = "paused_lock_screen"
     PAUSED_NON_WECHAT = "paused_non_wechat"
+    TRANSIENT_ERROR = "transient_error"
     HALTED_RISK_PHRASE = "halted_risk_phrase"
     HALTED_SEND_ERROR = "halted_send_error"
     HALTED_PREFLIGHT = "halted_preflight"

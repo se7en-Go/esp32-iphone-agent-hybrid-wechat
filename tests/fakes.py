@@ -10,7 +10,6 @@ from typing import Any
 
 from PIL import Image, ImageDraw
 
-from wechat_agent.adapters.driver import ConflictError, DriverError
 from wechat_agent.models import (
     Box,
     ClickResult,
@@ -124,7 +123,12 @@ def make_keyboard_chat_image(
     if with_side_toolbar_icons:
         # Outer voice & emoji icons outside pill bounds (with white inner ring, must NOT be merged into pill)
         draw.ellipse(_box_px(Box(0.03, 0.532, 0.10, 0.570), w, h), fill=(255, 255, 255), outline=(60, 60, 65), width=3)
-        draw.ellipse(_box_px(Box(0.795, 0.532, 0.865, 0.570), w, h), fill=(255, 255, 255), outline=(60, 60, 65), width=3)
+        draw.ellipse(
+            _box_px(Box(0.795, 0.532, 0.865, 0.570), w, h),
+            fill=(255, 255, 255),
+            outline=(60, 60, 65),
+            width=3,
+        )
     # Keyboard background
     draw.rectangle([0, int(0.58 * h), w, h], fill=(209, 212, 217))
     # Bottom row keys: grey space bar + optional blue Send button

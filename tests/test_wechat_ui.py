@@ -150,7 +150,9 @@ def test_outgoing_green_bubble_distinguished_from_incoming_white_bubble() -> Non
 
 def test_rapidocr_engine_smoke() -> None:
     import io
+
     from PIL import Image, ImageDraw, ImageFont
+
     from wechat_agent.vision.ocr import RapidOcrEngine
 
     engine = RapidOcrEngine()

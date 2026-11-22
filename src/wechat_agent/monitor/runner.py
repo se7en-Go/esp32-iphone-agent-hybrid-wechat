@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import io
 import random
+import signal
+import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -13,11 +16,12 @@ from PIL import Image
 
 from wechat_agent.adapters.driver import DriverError, PhoneDriver
 from wechat_agent.config import WeChatSendConfig
+from wechat_agent.evidence import prune_evidence_runs
 from wechat_agent.guards.rate_limit import MonitorRateLimiter
 from wechat_agent.guards.skill_guard import SkillGuard
 from wechat_agent.models import SendReport, SendStatus
 from wechat_agent.vision.geometry import canonicalize_chat_title
-from wechat_agent.vision.ocr import OcrEngine
+from wechat_agent.vision.ocr import OcrEngine, OcrError
 from wechat_agent.vision.wechat_ui import (
     ScreenKind,
     detect_existing_draft,
@@ -94,6 +98,9 @@ class MonitorRunner:
         clock: Callable[[], float] = time.time,
         sleeper: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
+        max_consecutive_errors: int = 5,
+        max_retained_reports: int = 200,
+        maintenance_interval_ticks: int = 100,
     ) -> None:
         self.driver = driver
         self.ocr = ocr
@@ -109,6 +116,51 @@ class MonitorRunner:
         self.skill_guard = SkillGuard(driver, skill_name=config.skill_name)
         self._sender_factory = sender_factory or self._default_sender_factory
         self._last_viewport_thumb: np.ndarray | None = None
+        self.max_consecutive_errors = max(1, int(max_consecutive_errors))
+        self.max_retained_reports = max(1, int(max_retained_reports))
+        self.maintenance_interval_ticks = max(1, int(maintenance_interval_ticks))
+        self._consecutive_errors = 0
+        self._stop_requested = False
+
+    def request_stop(self) -> None:
+        """Signal the resident loop to exit gracefully after the current tick."""
+        self._stop_requested = True
+
+    def _iter_llm_clients(self) -> list[object]:
+        clients: list[object] = []
+        seen: set[int] = set()
+        for root in (
+            self.gate,
+            getattr(self.gate, "llm_gate", None),
+            self.generator,
+            getattr(self.generator, "llm_generator", None),
+        ):
+            client = getattr(root, "client", None)
+            if client is not None and id(client) not in seen:
+                seen.add(id(client))
+                clients.append(client)
+        return clients
+
+    def _reset_llm_tick_circuits(self) -> None:
+        for client in self._iter_llm_clients():
+            reset_fn = getattr(client, "reset_tick_circuit", None)
+            if callable(reset_fn):
+                reset_fn()
+
+    def _any_llm_circuit_tripped(self) -> bool:
+        return any(bool(getattr(c, "tick_circuit_tripped", False)) for c in self._iter_llm_clients())
+
+    def _run_periodic_maintenance(self, *, tick_index: int, now: float) -> None:
+        if tick_index <= 0 or (tick_index % self.maintenance_interval_ticks) != 0:
+            return
+        try:
+            self.store.prune_storage(now=now)
+        except Exception:
+            pass
+        try:
+            prune_evidence_runs(self.config.resolved_path(self.config.evidence_root), now=now)
+        except Exception:
+            pass
 
     def _default_sender_factory(self, group_cfg: GroupPolicyConfig) -> SendMessageWorkflow:
         send_cfg = WeChatSendConfig(
@@ -186,8 +238,16 @@ class MonitorRunner:
             )
         group_name = canonicalize_chat_title(group_cfg.name)
         now = self._clock()
+        self._reset_llm_tick_circuits()
+        self._run_periodic_maintenance(tick_index=tick_index, now=now)
 
-        def tick_report(outcome: TickOutcome, message: str, **kwargs) -> TickReport:
+        def tick_report(
+            outcome: TickOutcome,
+            message: str,
+            *,
+            extra_audit: dict | None = None,
+            **kwargs,
+        ) -> TickReport:
             return self._finish_tick(
                 TickReport(
                     tick_index=tick_index,
@@ -196,19 +256,32 @@ class MonitorRunner:
                     outcome=outcome,
                     message=message,
                     **kwargs,
+                ),
+                extra_audit=extra_audit,
+            )
+
+        def transient_error_report(reason: str) -> TickReport:
+            self._last_viewport_thumb = None
+            self._consecutive_errors += 1
+            if self._consecutive_errors >= self.max_consecutive_errors:
+                return tick_report(
+                    TickOutcome.HALTED_PREFLIGHT,
+                    f"Halted after {self._consecutive_errors} consecutive transient errors: {reason}",
+                    should_halt=True,
+                    extra_audit={"consecutive_errors": self._consecutive_errors},
                 )
+            return tick_report(
+                TickOutcome.TRANSIENT_ERROR,
+                f"Transient monitor error ({self._consecutive_errors}/{self.max_consecutive_errors}): {reason}",
+                should_halt=False,
+                extra_audit={"consecutive_errors": self._consecutive_errors},
             )
 
         # 1. Observe + static-frame skip-OCR optimization
         try:
             obs = self.driver.observe()
         except DriverError as exc:
-            self._last_viewport_thumb = None
-            return tick_report(
-                TickOutcome.HALTED_PREFLIGHT,
-                f"Monitor observe/skill-check failed: {exc}",
-                should_halt=True,
-            )
+            return transient_error_report(f"observe failed: {exc}")
 
         curr_thumb = _compute_viewport_thumb(obs.image_bytes)
         static_frame = (
@@ -224,6 +297,7 @@ class MonitorRunner:
         new_incoming: list[ExtractedMessage] = []
 
         if static_frame:
+            self._consecutive_errors = 0
             self.store.touch_last_seen(group_name, now=now)
             if not self.store.has_pending(group_name, now=now):
                 return tick_report(
@@ -234,13 +308,10 @@ class MonitorRunner:
             try:
                 ocr_boxes = self.ocr.read_boxes(obs.image_bytes)
                 check = self.skill_guard.check_screen_text(ocr_boxes)
-            except DriverError as exc:
-                self._last_viewport_thumb = None
-                return tick_report(
-                    TickOutcome.HALTED_PREFLIGHT,
-                    f"Monitor observe/skill-check failed: {exc}",
-                    should_halt=True,
-                )
+            except (DriverError, OcrError) as exc:
+                return transient_error_report(f"OCR/skill-check failed: {exc}")
+
+            self._consecutive_errors = 0
 
             if check.stop:
                 self._last_viewport_thumb = None
@@ -350,6 +421,13 @@ class MonitorRunner:
                             now=now,
                         )
                 else:
+                    suspected_missed = sum(
+                        1
+                        for msg in visible
+                        if not self.store.has_recent_message_content(
+                            group_name, msg.role, msg.sender, msg.text, since_ts=since_ts
+                        )
+                    )
                     self.store.commit_baseline_batch(
                         group_name,
                         visible,
@@ -361,7 +439,13 @@ class MonitorRunner:
                     return tick_report(
                         TickOutcome.BASELINE_SEEDED,
                         "Viewport discontinuity (no overlap with previous screen); "
-                        f"safely re-anchored baseline with {len(visible)} visible message(s)",
+                        f"safely re-anchored baseline with {len(visible)} visible message(s) "
+                        f"(suspected_missed={suspected_missed})",
+                        extra_audit={
+                            "discontinuity": True,
+                            "suspected_missed_count": suspected_missed,
+                            "gap_seconds": gap,
+                        },
                     )
             else:
                 newly_arrived = visible[alignment.new_start:]
@@ -449,6 +533,17 @@ class MonitorRunner:
 
             decision = self.gate.evaluate(ctx)
             decision_dict = {**decision.to_dict(), "jev": to_jev_semantics(decision)}
+            if decision.intent == "llm_error_fallback" or self._any_llm_circuit_tripped():
+                # Per-tick fail-fast circuit breaker: do not multiply LLM timeout latency across
+                # remaining pending candidates in this tick; keep pending items queued for next tick.
+                return tick_report(
+                    TickOutcome.TRANSIENT_ERROR,
+                    f"LLM fail-fast circuit breaker tripped for current tick: {decision.reason}",
+                    new_incoming_count=len(new_incoming),
+                    human_takeover_detected=takeover_triggered,
+                    decision=decision_dict,
+                    extra_audit={"llm_circuit_tripped": True},
+                )
             if candidate.mentioned_self:
                 eff_min_conf = (
                     group_cfg.mention_min_confidence
@@ -734,8 +829,26 @@ class MonitorRunner:
             reply_text=candidate_text,
         )
 
-    def run_loop(self, *, max_ticks: int | None = None) -> list[TickReport]:
+    def run_loop(
+        self,
+        *,
+        max_ticks: int | None = None,
+        install_signal_handlers: bool = True,
+    ) -> list[TickReport]:
+        if max_ticks is not None and max_ticks <= 0:
+            raise ValueError(f"max_ticks must be a positive integer or None, got {max_ticks!r}")
+
+        bounded_reports: deque[TickReport] | None = (
+            deque(maxlen=self.max_retained_reports) if max_ticks is None else None
+        )
         reports: list[TickReport] = []
+
+        def _record_report(rep: TickReport) -> None:
+            if bounded_reports is not None:
+                bounded_reports.append(rep)
+            else:
+                reports.append(rep)
+
         preflight_err = self.preflight()
         if preflight_err is not None:
             group_name = canonicalize_chat_title(self.config.active_group.name) if self.config.active_group else ""
@@ -749,21 +862,53 @@ class MonitorRunner:
                     message=preflight_err,
                 )
             )
-            reports.append(halted)
-            return reports
+            _record_report(halted)
+            return list(bounded_reports) if bounded_reports is not None else reports
+
+        self._stop_requested = False
+        prev_sigint = None
+        prev_sigterm = None
+        installed_signals = False
+        if install_signal_handlers and threading.current_thread() is threading.main_thread():
+            def _handle_stop_signal(_signum: int, _frame: object) -> None:
+                self._stop_requested = True
+
+            try:
+                prev_sigint = signal.getsignal(signal.SIGINT)
+                prev_sigterm = signal.getsignal(signal.SIGTERM)
+                signal.signal(signal.SIGINT, _handle_stop_signal)
+                signal.signal(signal.SIGTERM, _handle_stop_signal)
+                installed_signals = True
+            except (ValueError, OSError):
+                installed_signals = False
 
         tick = 0
-        while max_ticks is None or tick < max_ticks:
-            rep = self.run_tick(tick_index=tick)
-            reports.append(rep)
-            if rep.should_halt:
-                break
-            tick += 1
-            if max_ticks is not None and tick >= max_ticks:
-                break
-            delay = self._rng.uniform(
-                self.config.poll_interval_min_seconds,
-                self.config.poll_interval_max_seconds,
-            )
-            self._sleeper(delay)
-        return reports
+        try:
+            while not self._stop_requested and (max_ticks is None or tick < max_ticks):
+                rep = self.run_tick(tick_index=tick)
+                _record_report(rep)
+                if rep.should_halt or self._stop_requested:
+                    break
+                tick += 1
+                if max_ticks is not None and tick >= max_ticks:
+                    break
+                if rep.outcome == TickOutcome.TRANSIENT_ERROR:
+                    delay = min(
+                        max(self.config.poll_interval_max_seconds, 2.0) * (2 ** max(0, self._consecutive_errors - 1)),
+                        30.0,
+                    )
+                else:
+                    delay = self._rng.uniform(
+                        self.config.poll_interval_min_seconds,
+                        self.config.poll_interval_max_seconds,
+                    )
+                self._sleeper(delay)
+        finally:
+            if installed_signals:
+                try:
+                    signal.signal(signal.SIGINT, prev_sigint)
+                    signal.signal(signal.SIGTERM, prev_sigterm)
+                except (ValueError, OSError):
+                    pass
+
+        return list(bounded_reports) if bounded_reports is not None else reports

@@ -22,7 +22,8 @@ _SYSTEM_PROMPT = """你是微信群聊监控的第一层意图与风险评估门
 }
 要求：
 1. confidence 和 risk_score 必须在 0.0 到 1.0 之间。
-2. 闲聊刷屏、群友互相对话且未涉及本号职责、信息不足、或存在高风险/敏感话题（验证码、密码、转账/红包、医疗/法律/投资建议、政治冲突）时：令 should_reply=false（或给出高 risk_score >= 0.7）。
+2. 闲聊刷屏、群友互相对话且未涉及本号职责、信息不足、或存在高风险/敏感话题
+   （验证码、密码、转账/红包、医疗/法律/投资建议、政治冲突）时：令 should_reply=false（或给出高 risk_score >= 0.7）。
 3. 只有在上下文明确指向本号或真实需要补充信息且低风险时，才返回 should_reply=true。"""
 
 
@@ -63,7 +64,7 @@ class LlmIntentGate:
             f"本号群昵称：{aliases}\n"
             + role_block
             + f"是否明确@本号：{ctx.message.mentioned_self}\n"
-            + f"最近上下文（按时间顺序）：\n"
+            + "最近上下文（按时间顺序）：\n"
             + "\n".join(history_lines)
             + f"\n\n当前待判定最新来信：\n[对方/{sender}]: {ctx.message.text}"
         )

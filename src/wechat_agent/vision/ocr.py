@@ -6,9 +6,13 @@ import io
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from wechat_agent.models import Box, OcrBox
+
+
+class OcrError(RuntimeError):
+    """Raised when image decoding or OCR inference fails (isolated from raw library tracebacks)."""
 
 
 @runtime_checkable
@@ -32,14 +36,20 @@ class RapidOcrEngine:
     def read_boxes(self, image_bytes: bytes) -> list[OcrBox]:
         if not image_bytes:
             return []
-        with Image.open(io.BytesIO(image_bytes)) as img:
-            rgb = img.convert("RGB")
-            width, height = rgb.size
-            if width <= 0 or height <= 0:
-                return []
-            arr = np.asarray(rgb)
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                rgb = img.convert("RGB")
+                width, height = rgb.size
+                if width <= 0 or height <= 0:
+                    return []
+                arr = np.asarray(rgb)
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            raise OcrError(f"Failed to decode image bytes for OCR: {exc}") from exc
 
-        result, _ = self._get_engine()(arr)
+        try:
+            result, _ = self._get_engine()(arr)
+        except Exception as exc:
+            raise OcrError(f"RapidOCR inference failed: {exc}") from exc
         if not result:
             return []
 

@@ -114,7 +114,10 @@ def test_llm_intent_gate_strict_json_and_fail_closed() -> None:
     # Valid fenced JSON with context passed through
     stub = _StubLlmClient(
         [
-            '```json\n{"should_reply": true, "intent": "followup_question", "confidence": 0.84, "risk_score": 0.12, "reason": "asking schedule"}\n```',
+            (
+                '```json\n{"should_reply": true, "intent": "followup_question", '
+                '"confidence": 0.84, "risk_score": 0.12, "reason": "asking schedule"}\n```'
+            ),
             "not valid json",
             json.dumps({"should_reply": "true", "intent": "x", "confidence": 0.9, "risk_score": 0.1}),
             json.dumps({"should_reply": True, "intent": "x", "confidence": 1.5, "risk_score": 0.1}),
@@ -215,7 +218,7 @@ def test_openai_compatible_client_http_and_secret_redaction(monkeypatch) -> None
         api_key="sk-super-secret-xyz",
         model="deepseek-chat",
     )
-    client = OpenAICompatibleLlmClient(cfg)
+    client = OpenAICompatibleLlmClient(cfg, sleeper=lambda _: None)
     out = client.chat_completion([{"role": "user", "content": "hi"}], json_mode=True)
     assert out == '{"ok": true}'
     assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
@@ -292,7 +295,7 @@ def test_llm_defaults_and_length_truncation_raises_and_fails_closed(monkeypatch)
             return None
 
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=30.0: _TruncatedResp())
-    client = OpenAICompatibleLlmClient(cfg)
+    client = OpenAICompatibleLlmClient(cfg, sleeper=lambda _: None)
     try:
         client.chat_completion([{"role": "user", "content": "hi"}], json_mode=True)
     except LlmClientError as exc:

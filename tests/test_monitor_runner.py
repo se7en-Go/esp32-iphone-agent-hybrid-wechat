@@ -296,10 +296,10 @@ def test_pause_on_lock_screen_left_group_and_halt_on_risk_phrase(tmp_path: Path)
 
 
 def test_group_monitor_example_config_and_send_error_halt(tmp_path: Path) -> None:
+    from tests.fakes import make_keyboard_chat_image
     from wechat_agent.config import repo_root
     from wechat_agent.models import PasteFlowResult, PasteRecoveryState
     from wechat_agent.monitor.config import load_monitor_config
-    from tests.fakes import make_keyboard_chat_image
 
     example = load_monitor_config(repo_root() / "config" / "group-monitor.example.yaml")
     assert example.mode == MonitorMode.OBSERVE_ONLY
@@ -335,7 +335,9 @@ def test_group_monitor_example_config_and_send_error_halt(tmp_path: Path) -> Non
         ],
     )
     driver.observe_queue = [Observation("m0", f_base), Observation("m1", f_ask), Observation("s0", f_ask)]
-    driver.click_handler = lambda *args: ClickResult("c-kb", clicked=True, command_acknowledged=True, image_bytes=kb_empty)
+    driver.click_handler = lambda *args: ClickResult(
+        "c-kb", clicked=True, command_acknowledged=True, image_bytes=kb_empty
+    )
     driver.paste_flow_handler = lambda *args, **kwargs: PasteFlowResult(
         ok=False,
         cmd_v_sent=0,

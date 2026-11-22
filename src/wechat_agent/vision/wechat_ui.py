@@ -47,17 +47,23 @@ class FocusedInputLayout:
 def _decode_rgb(image_bytes: bytes) -> np.ndarray | None:
     if not image_bytes:
         return None
-    with Image.open(io.BytesIO(image_bytes)) as img:
-        return np.asarray(img.convert("RGB"))
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            return np.asarray(img.convert("RGB"))
+    except (OSError, ValueError):
+        return None
 
 
 def _image_aspect(image_bytes: bytes, default: float = 0.463) -> float:
     if not image_bytes:
         return default
-    with Image.open(io.BytesIO(image_bytes)) as img:
-        w, h = img.size
-        if w > 0 and h > 0:
-            return w / h
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            w, h = img.size
+            if w > 0 and h > 0:
+                return w / h
+    except (OSError, ValueError):
+        return default
     return default
 
 
@@ -447,7 +453,11 @@ def detect_keyboard_and_focused_input(
             input_box.bottom - 0.004,
         )
 
-    return FocusedInputLayout(input_box=input_box, caret_box=caret_box, keyboard_top=max(kb_top_est, input_box.bottom + 0.008))
+    return FocusedInputLayout(
+        input_box=input_box,
+        caret_box=caret_box,
+        keyboard_top=max(kb_top_est, input_box.bottom + 0.008),
+    )
 
 
 def detect_existing_draft(ocr_boxes: list[OcrBox], input_box: Box) -> str | None:
