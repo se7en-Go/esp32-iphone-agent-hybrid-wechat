@@ -216,3 +216,139 @@ def test_store_pending_queue_burst_merge_priority_and_ttl_expiry(tmp_path: Path)
             store2._conn.execute("SELECT fingerprint, status FROM pending_queue ORDER BY id ASC").fetchall()
         )
         assert statuses == {"pq-1": "processed", "pq-3": "expired", "pq-4": "expired"}
+
+
+def test_store_single_instance_flock_and_atomic_batch_rollback(tmp_path: Path) -> None:
+    import pytest
+
+    from wechat_agent.monitor.store import MonitorInstanceLockError
+
+    db_path = tmp_path / "state" / "locked.db"
+    with MonitorStore(db_path) as store1:
+        assert store1.lock_path.is_file()
+        assert (store1.lock_path.stat().st_mode & 0o777) == 0o600
+        with pytest.raises(MonitorInstanceLockError, match="already holds lock"):
+            MonitorStore(db_path)
+
+        # Verify commit_arrived_batch atomically persists seen_messages + viewport + pending_queue together
+        g = "示例测试群"
+        m1 = ExtractedMessage(g, MessageRole.INCOMING, "请问价格", sender="测试群友A", mentioned_self=False)
+        m2 = ExtractedMessage(g, MessageRole.INCOMING, "@示例助手", sender="测试群友A", mentioned_self=True)
+        events, merged = store1.commit_arrived_batch(
+            g,
+            [m1, m2],
+            [("incoming", "测试群友A", "请问价格"), ("incoming", "测试群友A", "@示例助手")],
+            now=100.0,
+        )
+        assert len(events) == 2
+        assert len(merged) == 1
+        assert merged[0].text == "请问价格\n@示例助手"
+        assert store1.get_last_viewport(g) == [
+            ("incoming", "测试群友A", "请问价格"),
+            ("incoming", "测试群友A", "@示例助手"),
+        ]
+        assert len(store1.list_pending(g, now=105.0)) == 1
+
+    # Once closed, a new instance acquires the lock cleanly
+    with MonitorStore(db_path) as store2:
+        assert store2.next_event_seq("示例测试群") == 3
+
+
+def test_rate_limit_config_validation_and_quiet_range_bounds() -> None:
+    import math
+
+    import pytest
+
+    from wechat_agent.guards.rate_limit import _parse_quiet_range
+
+    assert _parse_quiet_range("") is None
+    assert _parse_quiet_range("off") is None
+    assert _parse_quiet_range("23:00-07:30") == ((23, 0), (7, 30))
+
+    for bad_quiet in ("25:00-07:00", "23:60-07:00", "23:00-24:00", "23:00-07:99", "abc-def", "23:00"):
+        with pytest.raises(ValueError):
+            _parse_quiet_range(bad_quiet)
+        with pytest.raises(ValueError):
+            RateLimitConfig(quiet_hours=bad_quiet)
+
+    for bad_kwargs in (
+        {"global_min_interval_seconds": 2.0},
+        {"global_min_interval_seconds": math.nan},
+        {"global_min_interval_seconds": True},
+        {"global_max_per_hour": 0},
+        {"global_max_per_hour": 31},
+        {"global_max_per_hour": True},
+        {"per_group_cooldown_seconds": -1.0},
+        {"per_group_cooldown_seconds": math.inf},
+        {"per_group_max_per_hour": 0},
+        {"per_group_max_per_hour": 31},
+        {"human_takeover_cooldown_seconds": -5.0},
+        {"human_takeover_cooldown_seconds": math.nan},
+        {"max_reply_chars": 0},
+        {"max_reply_chars": 5000},
+        {"forbidden_reply_patterns": ("[invalid",)},
+    ):
+        with pytest.raises(ValueError):
+            RateLimitConfig(**bad_kwargs)
+
+
+def test_monitor_config_strict_bools_timeouts_forbidden_list_and_multigroup_warning(tmp_path: Path) -> None:
+    import warnings
+
+    import pytest
+
+    from wechat_agent.config import load_config
+    from wechat_agent.guards.rate_limit import DEFAULT_FORBIDDEN_PATTERNS
+    from wechat_agent.monitor.config import load_monitor_config
+
+    # bool("false") == True bug MUST be rejected on every boolean config switch
+    for snippet in (
+        'allow_live_send: "false"\n',
+        'mention_must_reply: "false"\n',
+        'require_mounted_skill: "false"\n',
+        'target_groups:\n  - name: "示例测试群"\n    allow_dry_run_paste: "false"\n',
+        'target_groups:\n  - name: "示例测试群"\n    mention_must_reply: "false"\n',
+        'llm:\n  enabled: "false"\n',
+    ):
+        cfg_file = tmp_path / "bad_bool.yaml"
+        cfg_file.write_text(snippet, encoding="utf-8")
+        with pytest.raises(ValueError, match="boolean"):
+            load_monitor_config(cfg_file)
+
+    send_bad = tmp_path / "bad_send.yaml"
+    send_bad.write_text('require_mounted_skill: "false"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="boolean"):
+        load_config(send_bad)
+
+    # Explicit empty forbidden_reply_patterns: [] stays empty (distinct from omitted defaults),
+    # timeouts clamp to safe lower bounds, and multi-group config warns clearly about active_group.
+    good = tmp_path / "multi.yaml"
+    good.write_text(
+        """
+mode: observe-only
+allow_live_send: false
+cli_timeout_seconds: 1
+paste_flow_timeout_seconds: 2
+forbidden_reply_patterns: []
+target_groups:
+  - name: "示例群A"
+  - name: "示例群B"
+""",
+        encoding="utf-8",
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = load_monitor_config(good)
+    assert cfg.allow_live_send is False
+    assert cfg.cli_timeout_seconds == 5.0
+    assert cfg.paste_flow_timeout_seconds == 15.0
+    assert cfg.rate_limits.forbidden_reply_patterns == ()
+    assert cfg.active_group is not None and cfg.active_group.name == "示例群A"
+    assert any("target_groups[0]" in str(w.message) for w in caught)
+
+    # Omitted forbidden_reply_patterns keeps DEFAULT_FORBIDDEN_PATTERNS
+    omitted = tmp_path / "default_forb.yaml"
+    omitted.write_text('target_groups:\n  - name: "示例群A"\n', encoding="utf-8")
+    cfg_def = load_monitor_config(omitted)
+    assert cfg_def.rate_limits.forbidden_reply_patterns == DEFAULT_FORBIDDEN_PATTERNS
+

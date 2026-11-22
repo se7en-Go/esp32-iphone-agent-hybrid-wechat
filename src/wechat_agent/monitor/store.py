@@ -2,21 +2,37 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import sqlite3
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
+
 from wechat_agent.evidence import redact_dict
 from wechat_agent.vision.geometry import canonicalize_chat_title, normalize_text
 
-from .extractor import ViewportItem, _canonical_for_hash
+from .extractor import (
+    ViewportItem,
+    _canonical_for_hash,
+    compute_event_fingerprint,
+    merge_same_sender_bursts,
+)
 from .models import ContextTurn, ExtractedMessage, MessageRole
+
+
+class MonitorInstanceLockError(RuntimeError):
+    """Raised when another monitor process already holds the single-instance lock for this state DB."""
 
 
 def _ensure_private_parent(path: Path) -> None:
@@ -27,17 +43,71 @@ def _ensure_private_parent(path: Path) -> None:
 class MonitorStore:
     """Persistent state store for deduplication, idempotent reply locking, and rate-limit history."""
 
-    def __init__(self, db_path: Path, audit_log_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        audit_log_path: Path | None = None,
+        *,
+        acquire_lock: bool = True,
+    ) -> None:
         self.db_path = Path(db_path)
+        self.lock_path = self.db_path.with_name(f"{self.db_path.name}.lock")
         self.audit_log_path = Path(audit_log_path) if audit_log_path is not None else None
+        self._lock_fd: int | None = None
+        self._closed = False
         _ensure_private_parent(self.db_path)
         if self.audit_log_path is not None:
             _ensure_private_parent(self.audit_log_path)
 
-        self._conn = sqlite3.connect(str(self.db_path), timeout=10.0)
-        self._conn.row_factory = sqlite3.Row
-        os.chmod(self.db_path, 0o600)
-        self._init_schema()
+        if acquire_lock:
+            self._acquire_instance_lock()
+
+        try:
+            self._conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+            self._conn.row_factory = sqlite3.Row
+            os.chmod(self.db_path, 0o600)
+            self._init_schema()
+        except Exception:
+            self._release_instance_lock()
+            raise
+
+    def _acquire_instance_lock(self) -> None:
+        fd = os.open(str(self.lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        os.chmod(self.lock_path, 0o600)
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                os.close(fd)
+                if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK) or isinstance(
+                    exc, BlockingIOError
+                ):
+                    raise MonitorInstanceLockError(
+                        f"Another monitor instance already holds lock {self.lock_path} (db={self.db_path})"
+                    ) from exc
+                raise
+        try:
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        except OSError:
+            pass
+        self._lock_fd = fd
+
+    def _release_instance_lock(self) -> None:
+        fd = self._lock_fd
+        self._lock_fd = None
+        if fd is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     def _init_schema(self) -> None:
         with self._conn:
@@ -140,7 +210,13 @@ class MonitorStore:
             )
 
     def close(self) -> None:
-        self._conn.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._conn.close()
+        finally:
+            self._release_instance_lock()
 
     def __enter__(self) -> MonitorStore:
         return self
@@ -194,6 +270,28 @@ class MonitorStore:
             if isinstance(item, (list, tuple)) and len(item) == 3
         ]
 
+    def _save_last_viewport_in_tx(
+        self,
+        norm_group: str,
+        items: Sequence[ViewportItem],
+        *,
+        ts: float,
+        mark_baseline: bool = False,
+    ) -> None:
+        payload = json.dumps([[r, s, t] for r, s, t in items], ensure_ascii=False)
+        self._ensure_group_row(norm_group)
+        if mark_baseline:
+            self._conn.execute(
+                "UPDATE group_state SET baseline_seeded = 1, last_viewport_json = ?, last_seen_at = ? "
+                "WHERE group_title = ?",
+                (payload, ts, norm_group),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE group_state SET last_viewport_json = ?, last_seen_at = ? WHERE group_title = ?",
+                (payload, ts, norm_group),
+            )
+
     def save_last_viewport(
         self,
         group_title: str,
@@ -202,27 +300,27 @@ class MonitorStore:
     ) -> None:
         """Persist the ordered visible message sequence for suffix-overlap alignment."""
         ts = time.time() if now is None else float(now)
-        payload = json.dumps([[r, s, t] for r, s, t in items], ensure_ascii=False)
+        norm = canonicalize_chat_title(group_title)
         with self._conn:
-            norm = self._ensure_group_row(group_title)
-            self._conn.execute(
-                "UPDATE group_state SET last_viewport_json = ?, last_seen_at = ? WHERE group_title = ?",
-                (payload, ts, norm),
-            )
+            self._save_last_viewport_in_tx(norm, items, ts=ts, mark_baseline=False)
+
+    def _next_event_seq_in_tx(self, norm_group: str) -> int:
+        self._ensure_group_row(norm_group)
+        self._conn.execute(
+            "UPDATE group_state SET event_seq = event_seq + 1 WHERE group_title = ?",
+            (norm_group,),
+        )
+        row = self._conn.execute(
+            "SELECT event_seq FROM group_state WHERE group_title = ?",
+            (norm_group,),
+        ).fetchone()
+        return int(row["event_seq"]) if row else 1
 
     def next_event_seq(self, group_title: str) -> int:
         """Atomically allocate the next monotonic event sequence number for `group_title`."""
+        norm = canonicalize_chat_title(group_title)
         with self._conn:
-            norm = self._ensure_group_row(group_title)
-            self._conn.execute(
-                "UPDATE group_state SET event_seq = event_seq + 1 WHERE group_title = ?",
-                (norm,),
-            )
-            row = self._conn.execute(
-                "SELECT event_seq FROM group_state WHERE group_title = ?",
-                (norm,),
-            ).fetchone()
-            return int(row["event_seq"]) if row else 1
+            return self._next_event_seq_in_tx(norm)
 
     def has_recent_message_content(
         self,
@@ -257,6 +355,44 @@ class MonitorStore:
         ).fetchone()
         return row is not None
 
+    def _record_seen_in_tx(
+        self,
+        msg: ExtractedMessage,
+        *,
+        is_baseline: bool,
+        ts: float,
+    ) -> bool:
+        norm_group = canonicalize_chat_title(msg.group_title)
+        self._ensure_group_row(norm_group)
+        cur = self._conn.execute(
+            """
+            INSERT OR IGNORE INTO seen_messages
+                (fingerprint, group_title, role, sender, text, is_baseline, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                msg.fingerprint,
+                norm_group,
+                msg.role.value,
+                msg.sender,
+                msg.text,
+                1 if is_baseline else 0,
+                ts,
+                ts,
+            ),
+        )
+        inserted = cur.rowcount > 0
+        if not inserted:
+            self._conn.execute(
+                "UPDATE seen_messages SET last_seen_at = ? WHERE fingerprint = ?",
+                (ts, msg.fingerprint),
+            )
+        self._conn.execute(
+            "UPDATE group_state SET last_seen_at = ? WHERE group_title = ?",
+            (ts, norm_group),
+        )
+        return inserted
+
     def record_seen(
         self,
         msg: ExtractedMessage,
@@ -266,37 +402,88 @@ class MonitorStore:
     ) -> bool:
         """Record a message fingerprint. Returns True if newly inserted, False if already seen."""
         ts = time.time() if now is None else float(now)
-        norm_group = canonicalize_chat_title(msg.group_title)
         with self._conn:
-            self._ensure_group_row(norm_group)
-            cur = self._conn.execute(
-                """
-                INSERT OR IGNORE INTO seen_messages
-                    (fingerprint, group_title, role, sender, text, is_baseline, first_seen_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    msg.fingerprint,
+            return self._record_seen_in_tx(msg, is_baseline=is_baseline, ts=ts)
+
+    def _assign_event_in_tx(self, norm_group: str, msg: ExtractedMessage) -> ExtractedMessage:
+        seq = self._next_event_seq_in_tx(norm_group)
+        fp = compute_event_fingerprint(norm_group, seq, msg.role, msg.sender, msg.text)
+        return replace(msg, group_title=norm_group, fingerprint=fp)
+
+    def commit_baseline_batch(
+        self,
+        group_title: str,
+        messages: Sequence[ExtractedMessage],
+        viewport_items: Sequence[ViewportItem],
+        *,
+        mark_seeded: bool = True,
+        dedup_since_ts: float | None = None,
+        now: float | None = None,
+    ) -> list[ExtractedMessage]:
+        """Atomically persist baseline messages, viewport anchor, and seeded flag in a single transaction."""
+        ts = time.time() if now is None else float(now)
+        norm_group = canonicalize_chat_title(group_title)
+        persisted: list[ExtractedMessage] = []
+        with self._conn:
+            for msg in messages:
+                if dedup_since_ts is not None and self.has_recent_message_content(
                     norm_group,
-                    msg.role.value,
+                    msg.role,
                     msg.sender,
                     msg.text,
-                    1 if is_baseline else 0,
-                    ts,
-                    ts,
-                ),
+                    since_ts=dedup_since_ts,
+                ):
+                    continue
+                evt = self._assign_event_in_tx(norm_group, msg)
+                self._record_seen_in_tx(evt, is_baseline=True, ts=ts)
+                persisted.append(evt)
+            self._save_last_viewport_in_tx(
+                norm_group,
+                viewport_items,
+                ts=ts,
+                mark_baseline=mark_seeded,
             )
-            inserted = cur.rowcount > 0
-            if not inserted:
-                self._conn.execute(
-                    "UPDATE seen_messages SET last_seen_at = ? WHERE fingerprint = ?",
-                    (ts, msg.fingerprint),
+        return persisted
+
+    def commit_arrived_batch(
+        self,
+        group_title: str,
+        arrived_messages: Sequence[ExtractedMessage],
+        viewport_items: Sequence[ViewportItem],
+        *,
+        skipped_baseline_messages: Sequence[ExtractedMessage] = (),
+        burst_merge_window_seconds: float = 5.0,
+        pending_ttl_seconds: float = 180.0,
+        now: float | None = None,
+    ) -> tuple[list[ExtractedMessage], list[ExtractedMessage]]:
+        """Atomically allocate event_seq, persist seen_messages, advance viewport, and enqueue merged incoming."""
+        ts = time.time() if now is None else float(now)
+        norm_group = canonicalize_chat_title(group_title)
+        arrived_events: list[ExtractedMessage] = []
+        merged_incoming: list[ExtractedMessage] = []
+        with self._conn:
+            for skipped in skipped_baseline_messages:
+                evt_skip = self._assign_event_in_tx(norm_group, skipped)
+                self._record_seen_in_tx(evt_skip, is_baseline=True, ts=ts)
+            for msg in arrived_messages:
+                evt = self._assign_event_in_tx(norm_group, msg)
+                self._record_seen_in_tx(evt, is_baseline=False, ts=ts)
+                arrived_events.append(evt)
+            self._save_last_viewport_in_tx(norm_group, viewport_items, ts=ts, mark_baseline=False)
+
+            raw_incoming = [evt for evt in arrived_events if evt.role == MessageRole.INCOMING]
+            merged_incoming = merge_same_sender_bursts(
+                raw_incoming,
+                max_gap_seconds=burst_merge_window_seconds,
+            )
+            for inc in merged_incoming:
+                self._enqueue_pending_in_tx(
+                    inc,
+                    ttl_seconds=pending_ttl_seconds,
+                    burst_merge_window_seconds=burst_merge_window_seconds,
+                    ts=ts,
                 )
-            self._conn.execute(
-                "UPDATE group_state SET last_seen_at = ? WHERE group_title = ?",
-                (ts, norm_group),
-            )
-            return inserted
+        return arrived_events, merged_incoming
 
     def get_recent_context(self, group_title: str, *, limit: int = 8) -> list[ContextTurn]:
         """Return up to `limit` recent INCOMING/SELF turns in chronological order."""
@@ -349,8 +536,15 @@ class MonitorStore:
         reason: str = "",
         run_id: str = "",
         now: float | None = None,
+        allow_reclaim_statuses: Sequence[str] = (),
     ) -> bool:
-        """Acquire a persistent per-fingerprint decision/send record (`INSERT OR IGNORE`)."""
+        """Acquire a persistent per-fingerprint decision/send record.
+
+        Normally uses `INSERT OR IGNORE` so each fingerprint can only be processed once.
+        Only when `allow_reclaim_statuses` explicitly names definitely-unsent statuses
+        (e.g. `aborted_existing_draft`) may an existing row in one of those statuses be
+        atomically reclaimed; potentially-sent statuses are never reclaimed.
+        """
         ts = time.time() if now is None else float(now)
         norm_group = canonicalize_chat_title(group_title)
         with self._conn:
@@ -376,7 +570,37 @@ class MonitorStore:
                     ts,
                 ),
             )
-            return cur.rowcount > 0
+            if cur.rowcount > 0:
+                return True
+            reclaim = tuple(str(s) for s in allow_reclaim_statuses if str(s))
+            if not reclaim:
+                return False
+            placeholders = ",".join("?" for _ in reclaim)
+            upd = self._conn.execute(
+                f"""
+                UPDATE reply_history
+                SET group_title = ?, mode = ?, status = ?, intent = ?, confidence = ?,
+                    risk_score = ?, matched_rule = ?, reply_text = ?, reason = ?,
+                    run_id = ?, created_at = ?
+                WHERE fingerprint = ? AND status IN ({placeholders})
+                """,
+                (
+                    norm_group,
+                    mode,
+                    status,
+                    intent,
+                    float(confidence),
+                    float(risk_score),
+                    matched_rule,
+                    reply_text,
+                    reason,
+                    run_id,
+                    ts,
+                    fingerprint,
+                    *reclaim,
+                ),
+            )
+            return upd.rowcount > 0
 
     def update_reply_status(
         self,
@@ -399,7 +623,7 @@ class MonitorStore:
                 )
 
     def claim_bot_reply_match(self, group_title: str, text: str, *, since_ts: float) -> bool:
-        """Consume an unacknowledged `sent_confirmed` bot reply matching `text` so it isn't flagged as human takeover."""
+        """Consume an unacknowledged `sent_confirmed` bot reply matching `text` to avoid false takeover."""
         canon = re.sub(r"\s+", "", normalize_text(text))
         if not canon:
             return False
@@ -501,6 +725,68 @@ class MonitorStore:
         with self._conn:
             return self._expire_pending_locked(norm_group, ts)
 
+    def _enqueue_pending_in_tx(
+        self,
+        msg: ExtractedMessage,
+        *,
+        ttl_seconds: float,
+        burst_merge_window_seconds: float,
+        ts: float,
+    ) -> str:
+        ttl = max(1.0, float(ttl_seconds))
+        norm_group = canonicalize_chat_title(msg.group_title)
+        norm_sender = normalize_text(msg.sender)
+        self._expire_pending_locked(norm_group, ts)
+        if norm_sender:
+            latest = self._conn.execute(
+                """
+                SELECT id, fingerprint, sender, text, mentioned_self, updated_at
+                FROM pending_queue
+                WHERE group_title = ? AND status = 'pending'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (norm_group,),
+            ).fetchone()
+            if (
+                latest is not None
+                and normalize_text(str(latest["sender"] or "")) == norm_sender
+                and 0.0 <= (ts - float(latest["updated_at"])) <= burst_merge_window_seconds
+            ):
+                prev_text = str(latest["text"] or "")
+                merged_text = (
+                    f"{prev_text}\n{msg.text}" if prev_text and msg.text else (prev_text or msg.text)
+                )
+                merged_mention = 1 if (latest["mentioned_self"] or msg.mentioned_self) else 0
+                self._conn.execute(
+                    """
+                    UPDATE pending_queue
+                    SET text = ?, mentioned_self = ?, expires_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (merged_text, merged_mention, ts + ttl, ts, int(latest["id"])),
+                )
+                return str(latest["fingerprint"])
+
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO pending_queue
+                (fingerprint, group_title, sender, text, mentioned_self, status, created_at, expires_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                msg.fingerprint,
+                norm_group,
+                msg.sender,
+                msg.text,
+                1 if msg.mentioned_self else 0,
+                ts,
+                ts + ttl,
+                ts,
+            ),
+        )
+        return msg.fingerprint
+
     def enqueue_pending(
         self,
         msg: ExtractedMessage,
@@ -511,60 +797,13 @@ class MonitorStore:
     ) -> str:
         """Enqueue an incoming message, merging rapid adjacent messages from the same non-empty sender."""
         ts = time.time() if now is None else float(now)
-        ttl = max(1.0, float(ttl_seconds))
-        norm_group = canonicalize_chat_title(msg.group_title)
-        norm_sender = normalize_text(msg.sender)
         with self._conn:
-            self._expire_pending_locked(norm_group, ts)
-            if norm_sender:
-                latest = self._conn.execute(
-                    """
-                    SELECT id, fingerprint, sender, text, mentioned_self, updated_at
-                    FROM pending_queue
-                    WHERE group_title = ? AND status = 'pending'
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (norm_group,),
-                ).fetchone()
-                if (
-                    latest is not None
-                    and normalize_text(str(latest["sender"] or "")) == norm_sender
-                    and 0.0 <= (ts - float(latest["updated_at"])) <= burst_merge_window_seconds
-                ):
-                    prev_text = str(latest["text"] or "")
-                    merged_text = (
-                        f"{prev_text}\n{msg.text}" if prev_text and msg.text else (prev_text or msg.text)
-                    )
-                    merged_mention = 1 if (latest["mentioned_self"] or msg.mentioned_self) else 0
-                    self._conn.execute(
-                        """
-                        UPDATE pending_queue
-                        SET text = ?, mentioned_self = ?, expires_at = ?, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (merged_text, merged_mention, ts + ttl, ts, int(latest["id"])),
-                    )
-                    return str(latest["fingerprint"])
-
-            self._conn.execute(
-                """
-                INSERT OR IGNORE INTO pending_queue
-                    (fingerprint, group_title, sender, text, mentioned_self, status, created_at, expires_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-                """,
-                (
-                    msg.fingerprint,
-                    norm_group,
-                    msg.sender,
-                    msg.text,
-                    1 if msg.mentioned_self else 0,
-                    ts,
-                    ts + ttl,
-                    ts,
-                ),
+            return self._enqueue_pending_in_tx(
+                msg,
+                ttl_seconds=ttl_seconds,
+                burst_merge_window_seconds=burst_merge_window_seconds,
+                ts=ts,
             )
-            return msg.fingerprint
 
     def list_pending(self, group_title: str, *, now: float | None = None) -> list[ExtractedMessage]:
         """Expire stale items and return unexpired pending messages (@self prioritized, then FIFO)."""

@@ -16,7 +16,7 @@ from wechat_agent.monitor.decision import build_decision_gate, load_rules_yaml
 from wechat_agent.monitor.generators import HybridReplyGenerator, LlmReplyGenerator, RuleTemplateGenerator
 from wechat_agent.monitor.llm_client import OpenAICompatibleLlmClient
 from wechat_agent.monitor.runner import MonitorRunner
-from wechat_agent.monitor.store import MonitorStore
+from wechat_agent.monitor.store import MonitorInstanceLockError, MonitorStore
 from wechat_agent.vision.ocr import create_ocr_engine
 from wechat_agent.workflows.send_message import SendMessageWorkflow
 
@@ -45,11 +45,21 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--text", help="Exact message text to paste/send")
     group.add_argument("--text-file", type=Path, help="UTF-8 text file containing message text")
     mode = send_cmd.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", dest="send", action="store_false", help="Paste & verify only, stop before Send (default)")
+    mode.add_argument(
+        "--dry-run",
+        dest="send",
+        action="store_false",
+        help="Paste & verify only, stop before Send (default)",
+    )
     mode.add_argument("--send", dest="send", action="store_true", help="Explicitly execute guarded Send after paste")
     send_cmd.set_defaults(send=False)
     send_cmd.add_argument("--config", type=Path, help="Optional YAML config file")
-    send_cmd.add_argument("--allow-target", action="append", dest="allow_targets", help="Explicitly allow additional target")
+    send_cmd.add_argument(
+        "--allow-target",
+        action="append",
+        dest="allow_targets",
+        help="Explicitly allow additional target",
+    )
     send_cmd.add_argument("--skill", help="Override skill name (default: wechat-send)")
     send_cmd.add_argument("--ocr", help="Override OCR backend (default: rapidocr)")
     send_cmd.add_argument("--cli", help="Override iphone-agent CLI path")
@@ -219,12 +229,16 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
     ocr = create_ocr_engine(cfg.ocr_backend)
     max_ticks = 1 if args.once else args.max_ticks
 
-    with MonitorStore(
-        cfg.resolved_path(cfg.state_db_path),
-        cfg.resolved_path(cfg.audit_log_path),
-    ) as store:
-        runner = MonitorRunner(driver, ocr, cfg, store, gate, generator)
-        reports = runner.run_loop(max_ticks=max_ticks)
+    try:
+        with MonitorStore(
+            cfg.resolved_path(cfg.state_db_path),
+            cfg.resolved_path(cfg.audit_log_path),
+        ) as store:
+            runner = MonitorRunner(driver, ocr, cfg, store, gate, generator)
+            reports = runner.run_loop(max_ticks=max_ticks)
+    except MonitorInstanceLockError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
 
     payload = [r.to_dict() for r in reports]
     print(json.dumps(payload[0] if (args.once and len(payload) == 1) else payload, ensure_ascii=False, indent=2))

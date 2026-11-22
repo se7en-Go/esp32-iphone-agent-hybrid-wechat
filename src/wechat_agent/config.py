@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,41 @@ import yaml
 DEFAULT_IPHONE_AGENT_CLI = "/Users/seven/Documents/esp32-iphone-agent-hybrid-new/server/.venv/bin/iphone-agent"
 DEFAULT_IPHONE_AGENT_URL = "http://127.0.0.1:8890"
 DEFAULT_ALLOWED_TARGETS = ("文件传输助手",)
+
+
+def require_bool(value: Any, field_name: str, *, default: bool | None = None) -> bool:
+    """Strictly validate a YAML/config boolean flag (rejects truthy strings like 'false')."""
+    if value is None:
+        if default is not None:
+            return default
+        raise ValueError(f"{field_name} must be a boolean (true/false), got None")
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"{field_name} must be a YAML boolean (true/false), got {type(value).__name__}: {value!r}"
+        )
+    return value
+
+
+def clamp_timeout(
+    value: Any,
+    field_name: str,
+    *,
+    default: float,
+    min_seconds: float,
+    max_seconds: float | None = None,
+) -> float:
+    """Parse a finite numeric timeout (rejecting booleans/NaN/Inf) and clamp to safe bounds."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a number, got bool: {value!r}")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite, got {value!r}")
+    clamped = max(min_seconds, parsed)
+    if max_seconds is not None:
+        clamped = min(max_seconds, clamped)
+    return clamped
 
 
 def repo_root() -> Path:
@@ -81,12 +117,22 @@ def load_config(
     skill_name = skill_name_override or str(data.get("skill_name") or "wechat-send")
     ocr_backend = ocr_backend_override or str(data.get("ocr_backend") or "rapidocr")
     evidence_root = Path(str(data.get("evidence_root") or ".local-data/runs"))
-    cli_timeout = float(data.get("cli_timeout_seconds", 90.0))
-    paste_flow_timeout = max(cli_timeout, float(data.get("paste_flow_timeout_seconds", 180.0)))
+    cli_timeout = clamp_timeout(data.get("cli_timeout_seconds"), "cli_timeout_seconds", default=90.0, min_seconds=5.0)
+    paste_flow_timeout = max(
+        cli_timeout,
+        clamp_timeout(
+            data.get("paste_flow_timeout_seconds"),
+            "paste_flow_timeout_seconds",
+            default=180.0,
+            min_seconds=15.0,
+        ),
+    )
     point_rehome_retries = max(0, int(data.get("point_rehome_retries", 1)))
     pre_send_point_retries = max(1, int(data.get("pre_send_point_retries", 3)))
-    require_mounted_skill = bool(data.get("require_mounted_skill", True))
-    allow_group_count = bool(data.get("allow_group_count", False))
+    require_mounted_skill = require_bool(
+        data.get("require_mounted_skill"), "require_mounted_skill", default=True
+    )
+    allow_group_count = require_bool(data.get("allow_group_count"), "allow_group_count", default=False)
 
     if allowed_targets_override is not None:
         raw_targets = list(allowed_targets_override)

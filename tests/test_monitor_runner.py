@@ -975,3 +975,107 @@ def test_forbidden_reply_auto_rewrite_once_passes_or_blocks(tmp_path: Path) -> N
         assert res3.reply_text is None
         assert len(llm_skip.calls) == 3
 
+
+def test_aborted_existing_draft_reclaims_lock_on_retry_while_ambiguous_send_never_reclaims(tmp_path: Path) -> None:
+    from wechat_agent.models import SendReport, SendStatus
+
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    gate, gen = _rules_gate_and_gen()
+
+    f0 = _group_frame(ocr, header="示例测试群(12)", incoming=[])
+    f1 = _group_frame(
+        ocr,
+        header="示例测试群(12)",
+        incoming=[("测试群友A", "@运营助手 请问营业时间", Box(0.14, 0.25, 0.65, 0.31))],
+    )
+    driver.observe_queue = [
+        Observation("s0", f0),
+        Observation("s1", f1),
+        Observation("s2", f1),
+    ]
+
+    send_outcomes = [
+        SendReport(
+            status=SendStatus.ABORTED_EXISTING_DRAFT,
+            target="示例测试群",
+            text="@测试群友A 白天9点到晚上8点都在",
+            dry_run=False,
+            message="Existing unsent draft detected",
+            run_id="run-draft-1",
+            evidence_dir=str(tmp_path / "runs" / "run-draft-1"),
+            observed_draft="草稿",
+        ),
+        SendReport(
+            status=SendStatus.SENT_CONFIRMED,
+            target="示例测试群",
+            text="@测试群友A 白天9点到晚上8点都在",
+            dry_run=False,
+            message="Message sent and confirmed",
+            run_id="run-sent-2",
+            evidence_dir=str(tmp_path / "runs" / "run-sent-2"),
+        ),
+    ]
+    sender_calls: list[tuple[str, str, bool]] = []
+
+    class _StubSender:
+        def run(self, target: str, text: str, *, send: bool = False) -> SendReport:
+            sender_calls.append((target, text, send))
+            return send_outcomes.pop(0)
+
+    now = {"t": 1000.0}
+    cfg = _monitor_cfg(tmp_path, mode=MonitorMode.LIVE, allow_live_send=True, group_name="示例测试群")
+    with MonitorStore(cfg.state_db_path, cfg.audit_log_path) as store:
+        runner = MonitorRunner(
+            driver,
+            ocr,
+            cfg,
+            store,
+            gate,
+            gen,
+            sender_factory=lambda _g: _StubSender(),  # type: ignore[arg-type,return-value]
+            clock=lambda: now["t"],
+        )
+        assert runner.run_tick(0).outcome == TickOutcome.BASELINE_SEEDED
+
+        # Tick 1: existing draft aborts without sending -> item stays pending, reply_history='aborted_existing_draft'
+        now["t"] += 3.0
+        r1 = runner.run_tick(1)
+        assert r1.outcome == TickOutcome.SKIPPED_EXISTING_DRAFT
+        assert len(sender_calls) == 1
+        assert store.has_pending("示例测试群", now=now["t"]) is True
+
+        # Tick 2: draft cleared -> MUST reclaim the aborted_existing_draft lock and actually send!
+        now["t"] += 5.0
+        r2 = runner.run_tick(2)
+        assert r2.outcome == TickOutcome.REPLIED
+        assert len(sender_calls) == 2
+        assert store.has_pending("示例测试群", now=now["t"]) is False
+        row = store._conn.execute("SELECT status, run_id FROM reply_history ORDER BY id DESC LIMIT 1").fetchone()
+        assert tuple(row) == ("sent_confirmed", "run-sent-2")
+
+        # Contrast: potentially-sent statuses MUST NEVER be reclaimed even with allow_reclaim_statuses
+        for unsafe_status in (
+            "pending_send",
+            SendStatus.SEND_UNCONFIRMED.value,
+            SendStatus.ABORTED_PASTE_RECOVERY.value,
+            SendStatus.SENT_CONFIRMED.value,
+        ):
+            fp = f"fp-unsafe-{unsafe_status}"
+            assert store.record_reply_decision(
+                fingerprint=fp,
+                group_title="示例测试群",
+                mode="live",
+                status=unsafe_status,
+                now=now["t"],
+            ) is True
+            assert store.record_reply_decision(
+                fingerprint=fp,
+                group_title="示例测试群",
+                mode="live",
+                status="pending_send",
+                now=now["t"] + 1.0,
+                allow_reclaim_statuses=(SendStatus.ABORTED_EXISTING_DRAFT.value,),
+            ) is False
+
+

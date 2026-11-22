@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from wechat_agent.monitor.store import MonitorStore
+
+_QUIET_RANGE_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$")
 
 DEFAULT_FORBIDDEN_PATTERNS: tuple[str, ...] = (
     r"(?:验证码|动态码|校验码|短信码|OTP)",
@@ -33,12 +36,38 @@ class RateLimitConfig:
     forbidden_reply_patterns: tuple[str, ...] = DEFAULT_FORBIDDEN_PATTERNS
 
     def __post_init__(self) -> None:
-        if self.global_min_interval_seconds < 3.0:
+        if (
+            isinstance(self.global_min_interval_seconds, bool)
+            or not math.isfinite(self.global_min_interval_seconds)
+            or self.global_min_interval_seconds < 3.0
+        ):
             raise ValueError("global_min_interval_seconds cannot be lower than base floor 3.0s")
-        if not (1 <= self.global_max_per_hour <= 30):
+        if isinstance(self.global_max_per_hour, bool) or not (1 <= self.global_max_per_hour <= 30):
             raise ValueError("global_max_per_hour must be within 1..30")
-        if self.per_group_cooldown_seconds < 0 or self.per_group_max_per_hour < 1:
-            raise ValueError("invalid per-group rate limit configuration")
+        if (
+            isinstance(self.per_group_cooldown_seconds, bool)
+            or not math.isfinite(self.per_group_cooldown_seconds)
+            or self.per_group_cooldown_seconds < 0.0
+        ):
+            raise ValueError("per_group_cooldown_seconds must be a finite number >= 0")
+        if isinstance(self.per_group_max_per_hour, bool) or not (1 <= self.per_group_max_per_hour <= 30):
+            raise ValueError("per_group_max_per_hour must be within 1..30")
+        if (
+            isinstance(self.human_takeover_cooldown_seconds, bool)
+            or not math.isfinite(self.human_takeover_cooldown_seconds)
+            or self.human_takeover_cooldown_seconds < 0.0
+        ):
+            raise ValueError("human_takeover_cooldown_seconds must be a finite number >= 0")
+        if isinstance(self.max_reply_chars, bool) or not (1 <= self.max_reply_chars <= 2000):
+            raise ValueError("max_reply_chars must be within 1..2000")
+        _parse_quiet_range(self.quiet_hours)
+        for pat in self.forbidden_reply_patterns:
+            if not isinstance(pat, str):
+                raise ValueError(f"forbidden_reply_patterns entries must be str, got {type(pat).__name__}")
+            try:
+                re.compile(pat, re.IGNORECASE)
+            except re.error as exc:
+                raise ValueError(f"Invalid forbidden reply regex {pat!r}: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -49,15 +78,20 @@ class RateLimitDecision:
 
 
 def _parse_quiet_range(spec: str) -> tuple[tuple[int, int], tuple[int, int]] | None:
-    clean = (spec or "").strip()
+    if not isinstance(spec, str):
+        raise ValueError(f"quiet_hours must be a string, got {type(spec).__name__}")
+    clean = spec.strip()
     if not clean or clean.lower() == "off":
         return None
-    if "-" not in clean:
-        raise ValueError(f"Invalid quiet_hours format: {spec!r}")
-    left, right = clean.split("-", 1)
-    sh, _, sm = left.partition(":")
-    eh, _, em = right.partition(":")
-    return (int(sh), int(sm or "0")), (int(eh), int(em or "0"))
+    match = _QUIET_RANGE_RE.match(clean)
+    if not match:
+        raise ValueError(f"Invalid quiet_hours format (expected HH:MM-HH:MM or 'off'): {spec!r}")
+    sh, sm, eh, em = (int(g) for g in match.groups())
+    if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= eh <= 23 and 0 <= em <= 59):
+        raise ValueError(
+            f"quiet_hours hour must be 0..23 and minute must be 0..59, got {spec!r}"
+        )
+    return (sh, sm), (eh, em)
 
 
 def _in_quiet_window(moment: datetime, start: tuple[int, int], end: tuple[int, int]) -> bool:

@@ -10,6 +10,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from wechat_agent.config import require_bool
+
 
 class LlmClientError(RuntimeError):
     """Raised on LLM configuration, network, HTTP, or response-format failures (never includes secrets)."""
@@ -37,11 +39,14 @@ class LlmConfig:
     @classmethod
     def from_dict_and_env(cls, data: dict[str, Any] | None = None) -> LlmConfig:
         raw = data or {}
-        enabled = bool(raw.get("enabled", False))
+        if not isinstance(raw, dict):
+            raise ValueError(f"llm config must be a mapping, got {type(raw).__name__}")
+        raw_enabled = raw.get("enabled")
+        enabled = require_bool(raw_enabled, "llm.enabled", default=False)
         base_url = os.environ.get("LLM_BASE_URL") or str(raw.get("base_url") or "")
         api_key = os.environ.get("LLM_API_KEY") or str(raw.get("api_key") or "")
         model = os.environ.get("LLM_MODEL") or str(raw.get("model") or "")
-        if not enabled and base_url and api_key and model and raw.get("enabled") is None:
+        if not enabled and base_url and api_key and model and raw_enabled is None:
             # Explicit env triad without explicit enabled=false enables the client cleanly.
             enabled = True
         return cls(

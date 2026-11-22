@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,11 +15,41 @@ import yaml
 from wechat_agent.config import (
     DEFAULT_IPHONE_AGENT_CLI,
     DEFAULT_IPHONE_AGENT_URL,
+    clamp_timeout,
     repo_root,
+    require_bool,
 )
 from wechat_agent.guards.rate_limit import DEFAULT_FORBIDDEN_PATTERNS, RateLimitConfig
 from wechat_agent.monitor.llm_client import LlmConfig
 from wechat_agent.monitor.models import MonitorMode
+
+logger = logging.getLogger(__name__)
+
+
+def _require_unit_float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a number in [0, 1], got bool: {value!r}")
+    parsed = float(value)
+    if not math.isfinite(parsed) or not (0.0 <= parsed <= 1.0):
+        raise ValueError(f"{field_name} must be within [0.0, 1.0], got {value!r}")
+    return parsed
+
+
+def _require_nonneg_float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a number >= 0, got bool: {value!r}")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise ValueError(f"{field_name} must be a finite number >= 0, got {value!r}")
+    return parsed
+
+
+def _require_int_in_range(value: Any, field_name: str, *, lo: int, hi: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} must be an integer in [{lo}, {hi}], got {type(value).__name__}: {value!r}")
+    if not (lo <= value <= hi):
+        raise ValueError(f"{field_name} must be within {lo}..{hi}, got {value!r}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -67,6 +100,17 @@ class MonitorConfig:
     rate_limits: RateLimitConfig = RateLimitConfig()
     llm: LlmConfig = LlmConfig()
 
+    def __post_init__(self) -> None:
+        if len(self.target_groups) > 1:
+            active = self.target_groups[0].name
+            ignored = [g.name for g in self.target_groups[1:]]
+            msg = (
+                f"Single-group monitor currently watches only target_groups[0]={active!r}; "
+                f"ignoring {len(ignored)} additional group(s): {ignored!r}"
+            )
+            logger.warning(msg)
+            warnings.warn(msg, UserWarning, stacklevel=2)
+
     @property
     def active_group(self) -> GroupPolicyConfig | None:
         return self.target_groups[0] if self.target_groups else None
@@ -90,27 +134,56 @@ def _parse_group_entry(entry: Any) -> GroupPolicyConfig:
     return GroupPolicyConfig(
         name=name,
         gate=str(entry["gate"]).strip() if entry.get("gate") else None,
-        min_confidence=float(entry["min_confidence"]) if entry.get("min_confidence") is not None else None,
-        max_risk_score=float(entry["max_risk_score"]) if entry.get("max_risk_score") is not None else None,
+        min_confidence=(
+            _require_unit_float(entry["min_confidence"], f"target_groups[{name}].min_confidence")
+            if entry.get("min_confidence") is not None
+            else None
+        ),
+        max_risk_score=(
+            _require_unit_float(entry["max_risk_score"], f"target_groups[{name}].max_risk_score")
+            if entry.get("max_risk_score") is not None
+            else None
+        ),
         mention_min_confidence=(
-            float(entry["mention_min_confidence"]) if entry.get("mention_min_confidence") is not None else None
+            _require_unit_float(
+                entry["mention_min_confidence"],
+                f"target_groups[{name}].mention_min_confidence",
+            )
+            if entry.get("mention_min_confidence") is not None
+            else None
         ),
         mention_must_reply=(
-            bool(entry["mention_must_reply"]) if entry.get("mention_must_reply") is not None else None
+            require_bool(entry["mention_must_reply"], f"target_groups[{name}].mention_must_reply")
+            if entry.get("mention_must_reply") is not None
+            else None
         ),
         per_group_cooldown_seconds=(
-            float(entry["per_group_cooldown_seconds"])
+            _require_nonneg_float(
+                entry["per_group_cooldown_seconds"],
+                f"target_groups[{name}].per_group_cooldown_seconds",
+            )
             if entry.get("per_group_cooldown_seconds") is not None
             else None
         ),
         per_group_max_per_hour=(
-            int(entry["per_group_max_per_hour"]) if entry.get("per_group_max_per_hour") is not None else None
+            _require_int_in_range(
+                entry["per_group_max_per_hour"],
+                f"target_groups[{name}].per_group_max_per_hour",
+                lo=1,
+                hi=30,
+            )
+            if entry.get("per_group_max_per_hour") is not None
+            else None
         ),
         self_aliases=aliases,
         role_prompt=(
             str(entry["role_prompt"]).strip() if entry.get("role_prompt") is not None else None
         ),
-        allow_dry_run_paste=bool(entry.get("allow_dry_run_paste", False)),
+        allow_dry_run_paste=require_bool(
+            entry.get("allow_dry_run_paste"),
+            f"target_groups[{name}].allow_dry_run_paste",
+            default=False,
+        ),
     )
 
 
@@ -174,27 +247,94 @@ def load_monitor_config(
             rules_path = rp
 
     rl_data = data.get("rate_limits") or {}
-    forbidden = tuple(
-        str(pat)
-        for pat in (data.get("forbidden_reply_patterns") or DEFAULT_FORBIDDEN_PATTERNS)
-    )
+    if not isinstance(rl_data, dict):
+        raise ValueError(f"rate_limits must be a mapping, got {type(rl_data).__name__}")
+
+    # Distinguish explicit empty list `[]` (disable default patterns) from omitted / null (use defaults).
+    if "forbidden_reply_patterns" in data and data["forbidden_reply_patterns"] is not None:
+        raw_forbidden = data["forbidden_reply_patterns"]
+    elif "forbidden_reply_patterns" in rl_data and rl_data["forbidden_reply_patterns"] is not None:
+        raw_forbidden = rl_data["forbidden_reply_patterns"]
+    else:
+        raw_forbidden = None
+
+    if raw_forbidden is None:
+        forbidden: tuple[str, ...] = DEFAULT_FORBIDDEN_PATTERNS
+    else:
+        if not isinstance(raw_forbidden, list):
+            raise ValueError(
+                f"forbidden_reply_patterns must be a list of regex strings, got {type(raw_forbidden).__name__}"
+            )
+        forbidden = tuple(str(pat) for pat in raw_forbidden)
+
+    if "quiet_hours" in data and data["quiet_hours"] is not None:
+        quiet_hours_raw = data["quiet_hours"]
+    elif "quiet_hours" in rl_data and rl_data["quiet_hours"] is not None:
+        quiet_hours_raw = rl_data["quiet_hours"]
+    else:
+        quiet_hours_raw = "23:00-07:00"
+    if not isinstance(quiet_hours_raw, str):
+        raise ValueError(f"quiet_hours must be a string, got {type(quiet_hours_raw).__name__}")
+
+    def _rl_float(key: str, default: float) -> float:
+        raw_val = rl_data.get(key)
+        if raw_val is None:
+            return default
+        if isinstance(raw_val, bool):
+            raise ValueError(f"rate_limits.{key} must be a number, got bool")
+        return float(raw_val)
+
+    def _rl_int(key: str, default: int) -> int:
+        raw_val = rl_data.get(key)
+        if raw_val is None:
+            return default
+        if isinstance(raw_val, bool) or not isinstance(raw_val, int):
+            raise ValueError(f"rate_limits.{key} must be an integer, got {type(raw_val).__name__}")
+        return raw_val
+
     rate_limits = RateLimitConfig(
-        global_min_interval_seconds=float(rl_data.get("global_min_interval_seconds", 15.0)),
-        global_max_per_hour=int(rl_data.get("global_max_per_hour", 15)),
-        per_group_cooldown_seconds=float(rl_data.get("per_group_cooldown_seconds", 60.0)),
-        per_group_max_per_hour=int(rl_data.get("per_group_max_per_hour", 6)),
-        human_takeover_cooldown_seconds=float(rl_data.get("human_takeover_cooldown_seconds", 600.0)),
-        quiet_hours=str(data.get("quiet_hours") or rl_data.get("quiet_hours") or "23:00-07:00"),
-        max_reply_chars=int(rl_data.get("max_reply_chars", 240)),
+        global_min_interval_seconds=_rl_float("global_min_interval_seconds", 15.0),
+        global_max_per_hour=_rl_int("global_max_per_hour", 15),
+        per_group_cooldown_seconds=_rl_float("per_group_cooldown_seconds", 60.0),
+        per_group_max_per_hour=_rl_int("per_group_max_per_hour", 6),
+        human_takeover_cooldown_seconds=_rl_float("human_takeover_cooldown_seconds", 600.0),
+        quiet_hours=quiet_hours_raw,
+        max_reply_chars=_rl_int("max_reply_chars", 240),
         forbidden_reply_patterns=forbidden,
     )
 
     llm_cfg = LlmConfig.from_dict_and_env(data.get("llm") or {})
-    poll_min = max(0.5, float(data.get("poll_interval_min_seconds", 2.0)))
-    poll_max = max(poll_min, float(data.get("poll_interval_max_seconds", 3.0)))
-    pending_ttl = max(10.0, float(data.get("pending_ttl_seconds", 180.0)))
-    burst_merge = max(0.0, float(data.get("burst_merge_window_seconds", 5.0)))
-    short_disc = max(0.0, float(data.get("short_discontinuity_window_seconds", 90.0)))
+    poll_min = max(0.5, _require_nonneg_float(data.get("poll_interval_min_seconds", 2.0), "poll_interval_min_seconds"))
+    poll_max = max(
+        poll_min,
+        _require_nonneg_float(data.get("poll_interval_max_seconds", 3.0), "poll_interval_max_seconds"),
+    )
+    pending_ttl = max(10.0, _require_nonneg_float(data.get("pending_ttl_seconds", 180.0), "pending_ttl_seconds"))
+    burst_merge = _require_nonneg_float(
+        data.get("burst_merge_window_seconds", 5.0), "burst_merge_window_seconds"
+    )
+    short_disc = _require_nonneg_float(
+        data.get("short_discontinuity_window_seconds", 90.0),
+        "short_discontinuity_window_seconds",
+    )
+    cli_timeout = clamp_timeout(
+        data.get("cli_timeout_seconds"),
+        "cli_timeout_seconds",
+        default=90.0,
+        min_seconds=5.0,
+    )
+    paste_flow_timeout = max(
+        cli_timeout,
+        clamp_timeout(
+            data.get("paste_flow_timeout_seconds"),
+            "paste_flow_timeout_seconds",
+            default=180.0,
+            min_seconds=15.0,
+        ),
+    )
+
+    yaml_allow_live = require_bool(data.get("allow_live_send"), "allow_live_send", default=False)
+    allow_live_override = require_bool(allow_live_send_override, "allow_live_send_override", default=False)
 
     return MonitorConfig(
         iphone_agent_cli=cli_path,
@@ -202,28 +342,40 @@ def load_monitor_config(
         skill_name=str(data.get("skill_name") or "wechat-group-reply"),
         ocr_backend=str(data.get("ocr_backend") or "rapidocr"),
         mode=mode,
-        allow_live_send=bool(allow_live_send_override or data.get("allow_live_send", False)),
+        allow_live_send=allow_live_override or yaml_allow_live,
         target_groups=groups,
         self_aliases=self_aliases,
         role_prompt=str(data.get("role_prompt") or "").strip(),
         simulation_targets=sim_targets,
         rules_path=rules_path,
         default_gate=str(gate_override or data.get("default_gate") or "hybrid"),
-        min_confidence=0.70 if data.get("min_confidence") is None else float(data["min_confidence"]),
-        max_risk_score=0.30 if data.get("max_risk_score") is None else float(data["max_risk_score"]),
-        mention_min_confidence=(
-            0.50 if data.get("mention_min_confidence") is None else float(data["mention_min_confidence"])
+        min_confidence=(
+            0.70
+            if data.get("min_confidence") is None
+            else _require_unit_float(data["min_confidence"], "min_confidence")
         ),
-        mention_must_reply=bool(data.get("mention_must_reply", False)),
+        max_risk_score=(
+            0.30
+            if data.get("max_risk_score") is None
+            else _require_unit_float(data["max_risk_score"], "max_risk_score")
+        ),
+        mention_min_confidence=(
+            0.50
+            if data.get("mention_min_confidence") is None
+            else _require_unit_float(data["mention_min_confidence"], "mention_min_confidence")
+        ),
+        mention_must_reply=require_bool(data.get("mention_must_reply"), "mention_must_reply", default=False),
         context_window=max(1, int(data.get("context_window", 8))),
         poll_interval_min_seconds=poll_min,
         poll_interval_max_seconds=poll_max,
         pending_ttl_seconds=pending_ttl,
         burst_merge_window_seconds=burst_merge,
         short_discontinuity_window_seconds=short_disc,
-        cli_timeout_seconds=float(data.get("cli_timeout_seconds", 90.0)),
-        paste_flow_timeout_seconds=float(data.get("paste_flow_timeout_seconds", 180.0)),
-        require_mounted_skill=bool(data.get("require_mounted_skill", True)),
+        cli_timeout_seconds=cli_timeout,
+        paste_flow_timeout_seconds=paste_flow_timeout,
+        require_mounted_skill=require_bool(
+            data.get("require_mounted_skill"), "require_mounted_skill", default=True
+        ),
         state_db_path=Path(str(data.get("state_db_path") or ".local-data/state/wechat_monitor.db")),
         audit_log_path=Path(str(data.get("audit_log_path") or ".local-data/state/monitor_audit.jsonl")),
         evidence_root=Path(str(data.get("evidence_root") or ".local-data/runs")),

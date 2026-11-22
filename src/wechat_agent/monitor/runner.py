@@ -35,7 +35,6 @@ from .extractor import (
     ChatMessageExtractor,
     align_viewport_suffix,
     compute_event_fingerprint,
-    merge_same_sender_bursts,
     message_viewport_key,
 )
 from .generators.base import ReplyGenerator
@@ -287,16 +286,15 @@ class MonitorRunner:
 
             curr_keys = [message_viewport_key(m) for m in visible]
 
-            # 4. Baseline seeding on first entry into this group: mark existing history seen, never reply to old messages
+            # 4. Baseline seeding on first entry: mark existing history seen, never reply to old messages
             if not self.store.is_baseline_seeded(group_name):
-                for msg in visible:
-                    self.store.record_seen(
-                        self._assign_event_message(group_name, msg),
-                        is_baseline=True,
-                        now=now,
-                    )
-                self.store.save_last_viewport(group_name, curr_keys, now=now)
-                self.store.mark_baseline_seeded(group_name, now=now)
+                self.store.commit_baseline_batch(
+                    group_name,
+                    visible,
+                    curr_keys,
+                    mark_seeded=True,
+                    now=now,
+                )
                 self._last_viewport_thumb = curr_thumb if focused is None else None
                 return tick_report(
                     TickOutcome.BASELINE_SEEDED,
@@ -311,6 +309,7 @@ class MonitorRunner:
             prev_keys = self.store.get_last_viewport(group_name)
             alignment = align_viewport_suffix(prev_keys, curr_keys)
 
+            skipped_baseline: list[ExtractedMessage] = []
             if alignment.kind == "empty_curr":
                 self.store.touch_last_seen(group_name, now=now)
                 newly_arrived: list[ExtractedMessage] = []
@@ -340,34 +339,29 @@ class MonitorRunner:
                         or visible[idx].mentioned_self
                         or idx in tail_incoming
                     }
-                    for idx in unseen_indices:
-                        if idx not in keep_set:
-                            self.store.record_seen(
-                                self._assign_event_message(group_name, visible[idx]),
-                                is_baseline=True,
-                                now=now,
-                            )
+                    skipped_baseline = [visible[idx] for idx in unseen_indices if idx not in keep_set]
                     newly_arrived = [visible[idx] for idx in sorted(keep_set)]
                     if not newly_arrived:
-                        self.store.save_last_viewport(group_name, curr_keys, now=now)
-                else:
-                    for msg in visible:
-                        if not self.store.has_recent_message_content(
+                        self.store.commit_baseline_batch(
                             group_name,
-                            msg.role,
-                            msg.sender,
-                            msg.text,
-                            since_ts=since_ts,
-                        ):
-                            self.store.record_seen(
-                                self._assign_event_message(group_name, msg),
-                                is_baseline=True,
-                                now=now,
-                            )
-                    self.store.save_last_viewport(group_name, curr_keys, now=now)
+                            skipped_baseline,
+                            curr_keys,
+                            mark_seeded=False,
+                            now=now,
+                        )
+                else:
+                    self.store.commit_baseline_batch(
+                        group_name,
+                        visible,
+                        curr_keys,
+                        mark_seeded=False,
+                        dedup_since_ts=since_ts,
+                        now=now,
+                    )
                     return tick_report(
                         TickOutcome.BASELINE_SEEDED,
-                        f"Viewport discontinuity (no overlap with previous screen); safely re-anchored baseline with {len(visible)} visible message(s)",
+                        "Viewport discontinuity (no overlap with previous screen); "
+                        f"safely re-anchored baseline with {len(visible)} visible message(s)",
                     )
             else:
                 newly_arrived = visible[alignment.new_start:]
@@ -375,35 +369,23 @@ class MonitorRunner:
                     self.store.touch_last_seen(group_name, now=now)
 
             if newly_arrived:
-                # Persist newly arrived events with monotonic independent event fingerprints and advance anchor
-                arrived_events: list[ExtractedMessage] = []
-                for msg in newly_arrived:
-                    evt_msg = self._assign_event_message(group_name, msg)
-                    self.store.record_seen(evt_msg, is_baseline=False, now=now)
-                    arrived_events.append(evt_msg)
-                self.store.save_last_viewport(group_name, curr_keys, now=now)
+                # Atomically persist events, advance viewport anchor, and enqueue burst-merged INCOMING
+                arrived_events, new_incoming = self.store.commit_arrived_batch(
+                    group_name,
+                    newly_arrived,
+                    curr_keys,
+                    skipped_baseline_messages=skipped_baseline,
+                    burst_merge_window_seconds=self.config.burst_merge_window_seconds,
+                    pending_ttl_seconds=self.config.pending_ttl_seconds,
+                    now=now,
+                )
 
-                # 6. Process newly arrived SELF bubbles (takeover detection) and enqueue burst-merged INCOMING
-                raw_incoming: list[ExtractedMessage] = []
+                # 6. Process newly arrived SELF bubbles (takeover detection)
                 for evt_msg in arrived_events:
                     if evt_msg.role == MessageRole.SELF:
                         if not self.store.claim_bot_reply_match(group_name, evt_msg.text, since_ts=now - 300.0):
                             takeover_triggered = True
                             self.rate_limiter.activate_human_takeover(group_name, now=now)
-                    elif evt_msg.role == MessageRole.INCOMING:
-                        raw_incoming.append(evt_msg)
-
-                new_incoming = merge_same_sender_bursts(
-                    raw_incoming,
-                    max_gap_seconds=self.config.burst_merge_window_seconds,
-                )
-                for inc in new_incoming:
-                    self.store.enqueue_pending(
-                        inc,
-                        ttl_seconds=self.config.pending_ttl_seconds,
-                        burst_merge_window_seconds=self.config.burst_merge_window_seconds,
-                        now=now,
-                    )
 
         # 6b. Load unexpired pending queue ordered by @self priority then FIFO
         pending_candidates = self.store.list_pending(group_name, now=now)
@@ -647,7 +629,7 @@ class MonitorRunner:
                     reply_text=candidate_text,
                 )
 
-        # 12. Acquire idempotent SQLite lock for this fingerprint and mark queue processed
+        # 12. Acquire idempotent SQLite lock for this fingerprint (reclaiming ONLY definitely-unsent draft aborts)
         acquired = self.store.record_reply_decision(
             fingerprint=target_msg.fingerprint,
             group_title=group_name,
@@ -660,6 +642,7 @@ class MonitorRunner:
             reply_text=candidate_text,
             reason=decision.reason,
             now=now,
+            allow_reclaim_statuses=(SendStatus.ABORTED_EXISTING_DRAFT.value,),
         )
         if not acquired:
             self.store.mark_pending_status(target_msg.fingerprint, "processed", now=now)

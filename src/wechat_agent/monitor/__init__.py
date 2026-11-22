@@ -26,7 +26,7 @@ from .models import (
     TickReport,
 )
 from .runner import MonitorRunner
-from .store import MonitorStore
+from .store import MonitorInstanceLockError, MonitorStore
 
 __all__ = [
     "ChatMessageExtractor",
@@ -41,6 +41,7 @@ __all__ = [
     "LlmConfig",
     "MessageRole",
     "MonitorConfig",
+    "MonitorInstanceLockError",
     "MonitorMode",
     "MonitorRunner",
     "MonitorStore",
