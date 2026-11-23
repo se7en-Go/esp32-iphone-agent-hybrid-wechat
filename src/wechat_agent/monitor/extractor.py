@@ -39,8 +39,11 @@ _SELF_MAX_RIGHT_EDGE = 0.935
 _SELF_MIN_LEFT_EDGE = 0.13
 _SELF_WHITE_CARD_MIN_LEFT = 0.22
 _INCOMING_MIN_LEFT_EDGE = 0.10
-_INCOMING_MAX_LEFT_EDGE = 0.24
-_INCOMING_MAX_RIGHT_EDGE = 0.785
+_INCOMING_MAX_LEFT_EDGE = 0.215
+_INCOMING_MAX_RIGHT_EDGE = 0.850
+_INCOMING_NARROW_MAX_RIGHT_EDGE = 0.799
+_INCOMING_FULL_WIDTH_MAX_LEFT = 0.185
+_INCOMING_FULL_WIDTH_MAX_RIGHT = 0.840
 _GROUP_COUNT_RE = re.compile(r"\s*\(\d+\)$")
 _SYSTEM_MSG_RE = re.compile(
     r"^(?:"
@@ -415,8 +418,21 @@ def _measure_bubble_horizontal_span(
     rgb: np.ndarray,
     box: Box,
     canvas_lum: float,
+    *,
+    is_green: bool = False,
 ) -> tuple[float, float]:
-    """Measure the contiguous non-canvas horizontal extent `(left, right)` of the bubble containing `box`."""
+    """Measure the horizontal extent `(left, right)` of the bubble containing `box` by surface cues.
+
+    Uses surface-matched columns (green for green bubbles; white/raised or colorful card pixels
+    for white cards) with interior lookahead so:
+    - Internal light-grey subtext or recessed grey quote blocks (`#E5E5E5` / `#F2F2F2`) inside a
+      white bubble/card are bridged cleanly without premature truncation whenever bubble surface
+      resumes at the card border.
+    - External grey chat canvas (`|lum - canvas_lum| <= 5`, `sat <= 12`) and right-docked
+      translucent grey iOS AssistiveTouch floating balls (`lum < canvas_lum - 20`, `sat <= 14`,
+      with no white/colorful card surface beyond them) terminate the scan accurately at the true
+      bubble edge.
+    """
     h, w, _ = rgb.shape
     x0, y0, x1, y1 = _norm_box_to_pixels(box, w, h)
     band = rgb[y0:y1, :, :].astype(np.int16)
@@ -424,15 +440,123 @@ def _measure_bubble_horizontal_span(
         return box.left, box.right
     lum = band.mean(axis=2)
     sat = band.max(axis=2) - band.min(axis=2)
-    col_canvas = ((np.abs(lum - canvas_lum) <= 8.0) & (sat <= 14)).mean(axis=0)
+    col_canvas = ((np.abs(lum - canvas_lum) <= 3.5) & (sat <= 10)).mean(axis=0)
 
-    run_left = x0
-    while run_left > 0 and col_canvas[run_left - 1] < 0.65:
-        run_left -= 1
-    run_right = x1
-    while run_right < w and col_canvas[run_right] < 0.65:
-        run_right += 1
+    green_mask = (band[:, :, 1] - band[:, :, 0] >= 12) & (band[:, :, 1] - band[:, :, 2] >= 12)
+    col_green = green_mask.mean(axis=0)
+
+    if canvas_lum < 90.0:
+        col_white = ((lum >= canvas_lum + 8.0) & (~green_mask)).mean(axis=0)
+        col_dark_barrier = np.zeros(w, dtype=np.float32)
+    else:
+        white_thresh = max(246, int(round(canvas_lum + 6)))
+        col_white = (
+            (band[:, :, 0] >= white_thresh)
+            & (band[:, :, 1] >= white_thresh)
+            & (band[:, :, 2] >= white_thresh)
+            & (~green_mask)
+        ).mean(axis=0)
+        # Smooth dark-grey translucent AssistiveTouch outer ring in light mode (zero white/color).
+        col_dark_barrier = ((lum < canvas_lum - 20.0) & (sat <= 14)).mean(axis=0)
+
+    col_colorful = (sat >= 20).mean(axis=0)
+
+    if is_green:
+        col_surface = col_green >= 0.18
+    else:
+        col_surface = (col_white >= 0.15) | (col_colorful >= 0.20)
+
+    def _scan(start: int, step: int, limit: int) -> int:
+        last_surface = start
+        c = start
+        while c > limit if step < 0 else c < limit:
+            idx = c - 1 if step < 0 else c
+            if col_canvas[idx] >= 0.65:
+                break
+            in_outer_dock = (idx / w >= 0.80) or (idx / w <= 0.18)
+            if in_outer_dock and col_dark_barrier[idx] >= 0.55 and not col_surface[idx]:
+                break
+            if col_surface[idx]:
+                last_surface = idx if step < 0 else idx + 1
+            c += step
+        return last_surface
+
+    run_left = _scan(x0, -1, 0)
+    run_right = _scan(x1, 1, w)
     return run_left / w, run_right / w
+
+
+def _measure_bubble_top(
+    rgb: np.ndarray,
+    box: Box,
+    canvas_lum: float,
+    *,
+    is_green: bool = False,
+) -> float:
+    """Scan upward from `box.top` through contiguous bubble surface to find the container's top edge."""
+    h, w, _ = rgb.shape
+    x0, y0, x1, _ = _norm_box_to_pixels(box, w, h)
+    top_limit = max(0, int(round(_VIEWPORT_TOP * h)))
+    if y0 <= top_limit or x1 <= x0:
+        return box.top
+    strip = rgb[top_limit:y0, x0:x1].astype(np.int16)
+    if strip.size == 0:
+        return box.top
+    lum = strip.mean(axis=2)
+    sat = strip.max(axis=2) - strip.min(axis=2)
+    row_canvas = ((np.abs(lum - canvas_lum) <= 5.0) & (sat <= 12)).mean(axis=1)
+    row = y0 - 1
+    while row >= top_limit:
+        if row_canvas[row - top_limit] >= 0.65:
+            break
+        row -= 1
+    return (row + 1) / h
+
+
+def _detect_avatar_side(
+    rgb: np.ndarray,
+    bubble_top: float,
+    canvas_lum: float,
+    bottom_limit: float,
+) -> str:
+    """Detect whether an avatar sits in the left or right avatar column near `bubble_top`.
+
+    Ignores smooth low-saturation AssistiveTouch translucent grey (`lum` ~ 180..228, `sat <= 14`)
+    by requiring color saturation (`sat >= 16`) or strong contrast vs canvas.
+    Returns `"left"`, `"right"`, `"both"`, or `"none"`.
+    """
+    h, w, _ = rgb.shape
+    y_l0 = max(0, int(round(max(_VIEWPORT_TOP, bubble_top - 0.035) * h)))
+    y_l1 = min(h, int(round(min(bottom_limit, bubble_top + 0.038) * h)))
+    y_r0 = max(0, int(round(max(_VIEWPORT_TOP, bubble_top - 0.015) * h)))
+    y_r1 = min(h, int(round(min(bottom_limit, bubble_top + 0.048) * h)))
+
+    def _has_avatar(y0: int, y1: int, xa: float, xb: float) -> bool:
+        if y1 <= y0 + 2:
+            return False
+        x0 = max(0, int(round(xa * w)))
+        x1 = min(w, int(round(xb * w)))
+        if x1 <= x0 + 2:
+            return False
+        patch = rgb[y0:y1, x0:x1].astype(np.int16)
+        lum = patch.mean(axis=2)
+        sat = patch.max(axis=2) - patch.min(axis=2)
+        if canvas_lum < 90.0:
+            avatar_px = (sat >= 16) | (lum >= canvas_lum + 30.0)
+        else:
+            # Exclude AssistiveTouch grey (sat<=14, lum ~ 180..228); match colorful or crisp dark/white avatars.
+            avatar_px = (sat >= 16) | (lum <= canvas_lum - 65.0) | (lum >= canvas_lum + 10.0)
+        return float(avatar_px.mean()) >= 0.14
+
+    has_left = _has_avatar(y_l0, y_l1, 0.025, 0.140)
+    has_right = _has_avatar(y_r0, y_r1, 0.860, 0.975)
+    if has_left and has_right:
+        return "both"
+    if has_left:
+        return "left"
+    if has_right:
+        return "right"
+    return "none"
 
 
 def _has_continuous_white_bridge(rgb: np.ndarray, upper: Box, lower: Box, canvas_lum: float) -> bool:
@@ -454,7 +578,7 @@ def _has_continuous_white_bridge(rgb: np.ndarray, upper: Box, lower: Box, canvas
         return True
     lum = patch.mean(axis=2)
     sat = patch.max(axis=2) - patch.min(axis=2)
-    canvas_rows = ((np.abs(lum - canvas_lum) <= 8.0) & (sat <= 14)).mean(axis=1)
+    canvas_rows = ((np.abs(lum - canvas_lum) <= 5.0) & (sat <= 12)).mean(axis=1)
     return bool(float(canvas_rows.max()) < 0.55)
 
 
@@ -464,26 +588,50 @@ def classify_bubble_role(
     *,
     is_green: bool,
     is_white_card: bool,
+    avatar_side: str = "none",
 ) -> MessageRole:
-    """Classify a detected bubble strictly by container left/right geometry + surface type.
+    """Classify a detected bubble strictly by surface type + container geometry + avatar-side cue.
 
-    - SELF must hug the right bubble gutter (`0.80 <= right <= 0.935`, `left >= 0.13`),
-      accepting both green text bubbles and right-aligned white link/mini-program cards
-      (`left >= 0.22`) so own shared cards never trigger self-reply loops.
-    - INCOMING must hug the left bubble gutter (`0.10 <= left <= 0.24`) and must NOT hug
-      the right gutter (`right <= 0.785`), and must be a non-green white/raised card so
-      incoming green-background images/posters never trigger false human takeover.
-    - Centered, full-width, avatar-region, or conflicting bubbles return `MessageRole.UNKNOWN`.
+    - Green bubbles (`is_green=True`): `SELF` iff hugging the right bubble gutter
+      (`0.80 <= right <= 0.935`, `left >= 0.13`); otherwise `UNKNOWN` (drops incoming green
+      posters/images on the left so they never trigger false human takeover).
+    - White/raised bubbles (`is_white_card=True`, not green):
+      * Right-only white cards (`left >= 0.22`, `0.80 <= right <= 0.935`) -> `SELF` (prevents
+        self-reply loop on own shared link/mini-program cards).
+      * Left-only narrow/medium white bubbles (`0.10 <= left <= 0.215`, `right < 0.80`) -> `INCOMING`.
+      * Full-width white bubbles/cards touching BOTH left (`0.10 <= left <= 0.215`) and right
+        (`0.80 <= right <= 0.850`) gutters disambiguate via `avatar_side`:
+        - `"right"` -> `SELF` (protects wide SELF white/quote cards from misclassifying as INCOMING)
+        - `"left"` -> `INCOMING` (real multi-line full-width incoming WeChat bubble)
+        - `"both"` -> `UNKNOWN`
+        - `"none"` (e.g. avatarless synthetic frame) -> `INCOMING` iff strictly hugging the
+          incoming left margin (`left <= 0.185` and `right <= 0.840`), else `UNKNOWN`.
+    - Centered, full-screen, or avatar-column boxes return `MessageRole.UNKNOWN`.
     """
-    if _SELF_MIN_RIGHT_EDGE <= bubble_right <= _SELF_MAX_RIGHT_EDGE and bubble_left >= _SELF_MIN_LEFT_EDGE:
-        if is_green:
-            return MessageRole.SELF
-        if is_white_card and bubble_left >= _SELF_WHITE_CARD_MIN_LEFT:
+    if is_green:
+        if _SELF_MIN_RIGHT_EDGE <= bubble_right <= _SELF_MAX_RIGHT_EDGE and bubble_left >= _SELF_MIN_LEFT_EDGE:
             return MessageRole.SELF
         return MessageRole.UNKNOWN
 
+    if not is_white_card:
+        return MessageRole.UNKNOWN
+
+    # Right-aligned white/mini-program card (clearly detached from left incoming gutter)
+    if _SELF_MIN_RIGHT_EDGE <= bubble_right <= _SELF_MAX_RIGHT_EDGE and bubble_left >= _SELF_WHITE_CARD_MIN_LEFT:
+        return MessageRole.SELF
+
+    # Left-hugging white bubble (narrow/medium or full-width multi-line)
     if _INCOMING_MIN_LEFT_EDGE <= bubble_left <= _INCOMING_MAX_LEFT_EDGE and bubble_right <= _INCOMING_MAX_RIGHT_EDGE:
-        if is_white_card and not is_green:
+        if bubble_right <= _INCOMING_NARROW_MAX_RIGHT_EDGE:
+            return MessageRole.INCOMING
+        # Full-width white bubble/card spanning into 0.80..0.850: disambiguate via avatar column.
+        if avatar_side == "right":
+            return MessageRole.SELF
+        if avatar_side == "left":
+            return MessageRole.INCOMING
+        if avatar_side == "both":
+            return MessageRole.UNKNOWN
+        if bubble_left <= _INCOMING_FULL_WIDTH_MAX_LEFT and bubble_right <= _INCOMING_FULL_WIDTH_MAX_RIGHT:
             return MessageRole.INCOMING
         return MessageRole.UNKNOWN
 
@@ -532,12 +680,27 @@ class ChatMessageExtractor:
                 is_green = green_r >= 0.15
                 is_white = white_r >= 0.30 and _has_white_above(rgb, item.box, canvas_lum)
                 if is_green or is_white:
-                    b_left, b_right = _measure_bubble_horizontal_span(rgb, item.box, canvas_lum)
+                    b_left, b_right = _measure_bubble_horizontal_span(
+                        rgb,
+                        item.box,
+                        canvas_lum,
+                        is_green=is_green,
+                    )
+                    avatar_side = "none"
+                    if (
+                        not is_green
+                        and is_white
+                        and _INCOMING_MIN_LEFT_EDGE <= b_left <= _INCOMING_MAX_LEFT_EDGE
+                        and _INCOMING_NARROW_MAX_RIGHT_EDGE < b_right <= _INCOMING_MAX_RIGHT_EDGE
+                    ):
+                        b_top = _measure_bubble_top(rgb, item.box, canvas_lum, is_green=False)
+                        avatar_side = _detect_avatar_side(rgb, b_top, canvas_lum, bottom_limit)
                     role = classify_bubble_role(
                         b_left,
                         b_right,
                         is_green=is_green,
                         is_white_card=is_white,
+                        avatar_side=avatar_side,
                     )
                     if role == MessageRole.SELF and item.box.left <= 0.84:
                         self_items.append(item)

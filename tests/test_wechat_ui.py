@@ -17,6 +17,7 @@ from wechat_agent.vision.wechat_ui import (
     detect_existing_draft,
     detect_keyboard_and_focused_input,
     detect_screen_context,
+    extract_header_title,
     extract_outgoing_bubbles,
     find_chat_row_box,
     find_home_wechat_icon,
@@ -396,5 +397,25 @@ def test_header_title_unique_primary_box_strict_group_count_and_tight_outgoing_b
     for bad_target in ("*", "all", "测试\n群"):
         with pytest.raises(PolicyViolationError):
             TargetPolicy([bad_target])
+
+
+def test_header_title_excludes_viewport_top_timestamp_and_pure_timestamps() -> None:
+    # Real 500x1080 iPhone WeChat screen: nav header at y=[0.069, 0.094], top chat timestamp at y=[0.114, 0.133]
+    boxes_with_top_time = [
+        OcrBox("示例分享·测试3群（198）（12）", Box(0.140, 0.069, 0.846, 0.094)),
+        OcrBox("16:18", Box(0.450, 0.114, 0.552, 0.133)),
+    ]
+    assert extract_header_title(boxes_with_top_time) == "示例分享·测试3群(198)(12)"
+    assert has_exact_chat_title(boxes_with_top_time, "示例分享•测试3群（198）", allow_group_count=True) is True
+    assert (
+        detect_screen_context(boxes_with_top_time, "示例分享•测试3群（198）", allow_group_count=True)
+        == ScreenKind.TARGET_CHAT
+    )
+
+    # Pure timestamp even inside y <= 0.110 must never pollute header candidates or trigger OTHER_CHAT
+    only_timestamp = [OcrBox("昨天 09:30", Box(0.40, 0.080, 0.60, 0.102))]
+    assert extract_header_title(only_timestamp) is None
+    assert has_exact_chat_title(only_timestamp, "昨天 09:30", allow_group_count=True) is False
+    assert detect_screen_context(only_timestamp, "示例测试群", allow_group_count=True) != ScreenKind.OTHER_CHAT
 
 

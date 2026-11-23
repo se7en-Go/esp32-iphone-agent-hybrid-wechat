@@ -374,3 +374,102 @@ def test_viewport_alignment_with_occurrences_and_repeated_short_messages() -> No
         ("incoming", "测试群友A", "收到", 1),
     ]
     assert align_viewport_suffix(keys, curr_scrolled) == ViewportAlignment("aligned", 1, 1)
+
+
+def test_full_width_incoming_assistivetouch_wide_self_card_and_internal_quote() -> None:
+    import io
+
+    from PIL import Image, ImageDraw
+
+    from wechat_agent.monitor.extractor import _decode_rgb, _estimate_canvas_luminance, _measure_bubble_horizontal_span
+
+    w, h = 500, 1080
+    # 1. Full-width 2-line INCOMING white bubble [0.166, 0.828] touching right AssistiveTouch ball [0.828, 0.976]
+    incoming_touching_ball = Box(0.166, 0.190, 0.828, 0.275)
+    # 2. Full-width SELF white quote/link card [0.185, 0.845] with right-side avatar (must be SELF, never INCOMING!)
+    wide_self_white_card = Box(0.185, 0.340, 0.845, 0.460)
+    # 3. Right-aligned SELF white card [0.240, 0.845] containing internal recessed grey quote block (#E5E5E5)
+    self_card_with_quote = Box(0.240, 0.510, 0.845, 0.600)
+    # 4. Full-width INCOMING white bubble [0.166, 0.828] with left avatar & internal light-grey subtext/quote (#F2F2F2)
+    incoming_with_quote = Box(0.166, 0.660, 0.828, 0.760)
+
+    base = make_collapsed_chat_image(
+        w=w,
+        h=h,
+        incoming_boxes=[
+            incoming_touching_ball,
+            wide_self_white_card,
+            self_card_with_quote,
+            incoming_with_quote,
+        ],
+    )
+    img = Image.open(io.BytesIO(base)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # Left colorful avatars for bubbles #1 and #4
+    draw.rectangle([int(0.03 * w), int(0.165 * h), int(0.135 * w), int(0.215 * h)], fill=(65, 135, 225))
+    draw.rectangle([int(0.03 * w), int(0.635 * h), int(0.135 * w), int(0.685 * h)], fill=(220, 110, 60))
+    # Right colorful avatars for SELF white cards #2 and #3
+    draw.rectangle([int(0.865 * w), int(0.340 * h), int(0.970 * w), int(0.390 * h)], fill=(70, 175, 110))
+    draw.rectangle([int(0.865 * w), int(0.510 * h), int(0.970 * w), int(0.560 * h)], fill=(70, 175, 110))
+
+    # Translucent dark-grey AssistiveTouch floating ball docked on right edge touching bubble #1 (0.828..0.976)
+    draw.rectangle([int(0.828 * w), int(0.195 * h), int(0.846 * w), int(0.270 * h)], fill=(227, 226, 228))
+    draw.rectangle([int(0.846 * w), int(0.195 * h), int(0.960 * w), int(0.270 * h)], fill=(188, 186, 189))
+    draw.rectangle([int(0.960 * w), int(0.195 * h), int(0.976 * w), int(0.270 * h)], fill=(226, 224, 227))
+
+    # Internal recessed grey quote blocks inside cards #3 (#E5E5E5) and #4 (#F2F2F2), keeping outer white margins
+    draw.rectangle([int(0.420 * w), int(0.525 * h), int(0.805 * w), int(0.585 * h)], fill=(229, 229, 229))
+    draw.rectangle([int(0.450 * w), int(0.675 * h), int(0.790 * w), int(0.745 * h)], fill=(242, 242, 242))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    raw_bytes = buf.getvalue()
+
+    rgb = _decode_rgb(raw_bytes)
+    assert rgb is not None
+    canvas_lum = _estimate_canvas_luminance(rgb, 0.875)
+
+    # Verify AssistiveTouch floating ball is cleanly truncated at ~0.828 (never bleeds to 0.96+)
+    span1 = _measure_bubble_horizontal_span(rgb, Box(0.206, 0.205, 0.790, 0.228), canvas_lum, is_green=False)
+    assert 0.160 <= span1[0] <= 0.172
+    assert 0.820 <= span1[1] <= 0.834
+
+    # Verify internal grey quote block (#E5E5E5) inside SELF white card does NOT prematurely truncate right edge
+    span3 = _measure_bubble_horizontal_span(rgb, Box(0.260, 0.535, 0.410, 0.565), canvas_lum, is_green=False)
+    assert 0.235 <= span3[0] <= 0.245
+    assert 0.840 <= span3[1] <= 0.850
+
+    # Verify internal light-grey quote block (#F2F2F2) inside INCOMING white bubble does NOT truncate right edge
+    span4 = _measure_bubble_horizontal_span(rgb, Box(0.200, 0.690, 0.440, 0.720), canvas_lum, is_green=False)
+    assert 0.160 <= span4[0] <= 0.172
+    assert 0.822 <= span4[1] <= 0.834
+
+    ocr = [
+        OcrBox("示例测试群(12)", Box(0.28, 0.069, 0.72, 0.094)),
+        OcrBox("测试群友A", Box(0.170, 0.160, 0.280, 0.180)),
+        OcrBox("@示例助手 这款怎么团购下", Box(0.206, 0.205, 0.790, 0.228)),
+        OcrBox("单？", Box(0.204, 0.234, 0.284, 0.258)),
+        # Wide SELF white card (2 lines, line 2 below avatar -> must still resolve to SELF via bubble_top!)
+        OcrBox("官方商品链接详情标题", Box(0.215, 0.360, 0.680, 0.388)),
+        OcrBox("点击卡片查看团购规则说明", Box(0.215, 0.415, 0.700, 0.442)),
+        # Right-aligned SELF white card with internal grey quote block
+        OcrBox("已核对活动链接", Box(0.260, 0.535, 0.410, 0.565)),
+        # Full-width INCOMING white bubble with internal light-grey quote block
+        OcrBox("测试群友B", Box(0.170, 0.630, 0.280, 0.650)),
+        OcrBox("请问今天还发货吗？", Box(0.200, 0.690, 0.440, 0.720)),
+    ]
+
+    msgs = ChatMessageExtractor().extract(
+        raw_bytes,
+        ocr,
+        group_title="示例测试群(12)",
+        self_aliases=("示例助手",),
+        captured_at=1000.0,
+    )
+    assert [(m.role, m.sender, m.text, m.mentioned_self) for m in msgs] == [
+        (MessageRole.INCOMING, "测试群友A", "@示例助手 这款怎么团购下\n单？", True),
+        (MessageRole.SELF, "", "官方商品链接详情标题\n点击卡片查看团购规则说明", False),
+        (MessageRole.SELF, "", "已核对活动链接", False),
+        (MessageRole.INCOMING, "测试群友B", "请问今天还发货吗？", False),
+    ]

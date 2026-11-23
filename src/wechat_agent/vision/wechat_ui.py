@@ -86,18 +86,32 @@ def _has_bottom_wechat_tabs(ocr_boxes: list[OcrBox]) -> bool:
 
 _STRICT_GROUP_COUNT_RE = re.compile(r"^\(([1-9]\d{0,3})\)$")
 _MAX_GROUP_MEMBER_COUNT = 2000
+_HEADER_TIMESTAMP_RE = re.compile(
+    r"^(?:"
+    r"\d{1,2}:\d{2}"
+    r"|(?:昨天|前天|今天)\s*\d{1,2}:\d{2}"
+    r"|(?:星期|周)[一二三四五六日天]\s*\d{1,2}:\d{2}"
+    r"|\d{4}年\d{1,2}月\d{1,2}日.*"
+    r")$"
+)
 
 
 def _header_title_candidates(ocr_boxes: list[OcrBox]) -> list[OcrBox]:
-    """Return non-empty OCR boxes inside the WeChat iOS top navigation title slot (excluding status bar)."""
-    return [
-        b
-        for b in ocr_boxes
-        if 0.045 <= b.box.top
-        and b.box.bottom <= 0.14
-        and 0.14 <= b.box.center[0] <= 0.86
-        and normalize_text(b.text)
-    ]
+    """Return non-empty OCR boxes inside the WeChat iOS top navigation title slot.
+
+    Restricts `bottom <= 0.110` (above the chat viewport's top edge) and excludes pure
+    system timestamps so chat-viewport timestamps like `16:18` at `y ≈ 0.114..0.133` never
+    pollute navigation title detection.
+    """
+    out: list[OcrBox] = []
+    for b in ocr_boxes:
+        if not (0.045 <= b.box.top and b.box.bottom <= 0.110 and 0.14 <= b.box.center[0] <= 0.86):
+            continue
+        norm = normalize_text(b.text)
+        if not norm or _HEADER_TIMESTAMP_RE.match(norm):
+            continue
+        out.append(b)
+    return out
 
 
 def extract_header_title(ocr_boxes: list[OcrBox]) -> str | None:
@@ -206,11 +220,7 @@ def detect_screen_context(
             return ScreenKind.HOME_SCREEN
 
     # Any other non-clock title in the top navigation bar without bottom tabs indicates another chat/page.
-    header_texts = [
-        normalize_text(b.text)
-        for b in ocr_boxes
-        if 0.045 <= b.box.top <= 0.13 and 0.18 <= b.box.center[0] <= 0.82
-    ]
+    header_texts = [normalize_text(b.text) for b in _header_title_candidates(ocr_boxes)]
     if header_texts:
         return ScreenKind.OTHER_CHAT
 
