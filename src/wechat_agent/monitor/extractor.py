@@ -41,6 +41,8 @@ _SELF_WHITE_CARD_MIN_LEFT = 0.22
 _INCOMING_MIN_LEFT_EDGE = 0.10
 _INCOMING_MAX_LEFT_EDGE = 0.215
 _INCOMING_MAX_RIGHT_EDGE = 0.850
+# Beyond this point too little of the opposite avatar gutter remains visible.
+_INCOMING_AVATAR_MAX_RIGHT_EDGE = 0.900
 _INCOMING_NARROW_MAX_RIGHT_EDGE = 0.799
 _INCOMING_FULL_WIDTH_MAX_LEFT = 0.185
 _INCOMING_FULL_WIDTH_MAX_RIGHT = 0.840
@@ -518,12 +520,16 @@ def _detect_avatar_side(
     bubble_top: float,
     canvas_lum: float,
     bottom_limit: float,
+    *,
+    extra_wide_span: tuple[float, float] | None = None,
 ) -> str:
     """Detect whether an avatar sits in the left or right avatar column near `bubble_top`.
 
     Ignores smooth low-saturation AssistiveTouch translucent grey (`lum` ~ 180..228, `sat <= 14`)
     by requiring color saturation (`sat >= 16`) or strong contrast vs canvas.
-    Returns `"left"`, `"right"`, `"both"`, or `"none"`.
+    An extra-wide bubble can overlap either sample column. Count only pixels
+    outside its span. An achromatic left candidate needs a sender label to
+    distinguish it from a docked high-contrast floating control.
     """
     h, w, _ = rgb.shape
     y_l0 = max(0, int(round(max(_VIEWPORT_TOP, bubble_top - 0.035) * h)))
@@ -531,13 +537,19 @@ def _detect_avatar_side(
     y_r0 = max(0, int(round(max(_VIEWPORT_TOP, bubble_top - 0.015) * h)))
     y_r1 = min(h, int(round(min(bottom_limit, bubble_top + 0.048) * h)))
 
-    def _has_avatar(y0: int, y1: int, xa: float, xb: float) -> bool:
+    def _sample(side: str, y0: int, y1: int, xa: float, xb: float) -> str:
         if y1 <= y0 + 2:
-            return False
+            return "none"
         x0 = max(0, int(round(xa * w)))
         x1 = min(w, int(round(xb * w)))
+        area = (x1 - x0) * (y1 - y0)
+        if extra_wide_span is not None:
+            if side == "left":
+                x1 = min(x1, round(extra_wide_span[0] * w))
+            else:
+                x0 = max(x0, round(extra_wide_span[1] * w))
         if x1 <= x0 + 2:
-            return False
+            return "none"
         patch = rgb[y0:y1, x0:x1].astype(np.int16)
         lum = patch.mean(axis=2)
         sat = patch.max(axis=2) - patch.min(axis=2)
@@ -546,17 +558,17 @@ def _detect_avatar_side(
         else:
             # Exclude AssistiveTouch grey (sat<=14, lum ~ 180..228); match colorful or crisp dark/white avatars.
             avatar_px = (sat >= 16) | (lum <= canvas_lum - 65.0) | (lum >= canvas_lum + 10.0)
-        return float(avatar_px.mean()) >= 0.14
+        if np.count_nonzero(avatar_px) < 0.14 * area:
+            return "none"
+        if extra_wide_span is not None and side == "left" and np.count_nonzero(sat >= 24) < 0.08 * area:
+            return "left_needs_label"
+        return side
 
-    has_left = _has_avatar(y_l0, y_l1, 0.025, 0.140)
-    has_right = _has_avatar(y_r0, y_r1, 0.860, 0.975)
-    if has_left and has_right:
+    left = _sample("left", y_l0, y_l1, 0.025, 0.140)
+    right = _sample("right", y_r0, y_r1, 0.860, 0.975)
+    if left != "none" and right != "none":
         return "both"
-    if has_left:
-        return "left"
-    if has_right:
-        return "right"
-    return "none"
+    return left if left != "none" else right
 
 
 def _has_continuous_white_bridge(rgb: np.ndarray, upper: Box, lower: Box, canvas_lum: float) -> bool:
@@ -606,6 +618,8 @@ def classify_bubble_role(
         - `"both"` -> `UNKNOWN`
         - `"none"` (e.g. avatarless synthetic frame) -> `INCOMING` iff strictly hugging the
           incoming left margin (`left <= 0.185` and `right <= 0.840`), else `UNKNOWN`.
+      * Further into the right gutter (`0.850 < right <= 0.900`), only a verified left
+        avatar can establish an incoming message.
     - Centered, full-screen, or avatar-column boxes return `MessageRole.UNKNOWN`.
     """
     if is_green:
@@ -620,21 +634,20 @@ def classify_bubble_role(
     if _SELF_MIN_RIGHT_EDGE <= bubble_right <= _SELF_MAX_RIGHT_EDGE and bubble_left >= _SELF_WHITE_CARD_MIN_LEFT:
         return MessageRole.SELF
 
-    # Left-hugging white bubble (narrow/medium or full-width multi-line)
-    if _INCOMING_MIN_LEFT_EDGE <= bubble_left <= _INCOMING_MAX_LEFT_EDGE and bubble_right <= _INCOMING_MAX_RIGHT_EDGE:
-        if bubble_right <= _INCOMING_NARROW_MAX_RIGHT_EDGE:
+    if (
+        _INCOMING_MIN_LEFT_EDGE <= bubble_left <= _INCOMING_MAX_LEFT_EDGE
+        and bubble_right <= _INCOMING_AVATAR_MAX_RIGHT_EDGE
+    ):
+        if bubble_right <= _INCOMING_NARROW_MAX_RIGHT_EDGE or avatar_side == "left":
             return MessageRole.INCOMING
-        # Full-width white bubble/card spanning into 0.80..0.850: disambiguate via avatar column.
-        if avatar_side == "right":
+        if avatar_side == "right" and bubble_right <= _INCOMING_MAX_RIGHT_EDGE:
             return MessageRole.SELF
-        if avatar_side == "left":
+        if (
+            avatar_side == "none"
+            and bubble_left <= _INCOMING_FULL_WIDTH_MAX_LEFT
+            and bubble_right <= _INCOMING_FULL_WIDTH_MAX_RIGHT
+        ):
             return MessageRole.INCOMING
-        if avatar_side == "both":
-            return MessageRole.UNKNOWN
-        if bubble_left <= _INCOMING_FULL_WIDTH_MAX_LEFT and bubble_right <= _INCOMING_FULL_WIDTH_MAX_RIGHT:
-            return MessageRole.INCOMING
-        return MessageRole.UNKNOWN
-
     return MessageRole.UNKNOWN
 
 
@@ -661,6 +674,7 @@ class ChatMessageExtractor:
         incoming_items: list[OcrBox] = []
         canvas_labels: list[OcrBox] = []
         clipped_regions: list[Box] = []
+        needs_sender_label: list[tuple[OcrBox, Box]] = []
 
         for item in ocr_boxes:
             text = normalize_text(item.text)
@@ -691,10 +705,16 @@ class ChatMessageExtractor:
                         not is_green
                         and is_white
                         and _INCOMING_MIN_LEFT_EDGE <= b_left <= _INCOMING_MAX_LEFT_EDGE
-                        and _INCOMING_NARROW_MAX_RIGHT_EDGE < b_right <= _INCOMING_MAX_RIGHT_EDGE
+                        and _INCOMING_NARROW_MAX_RIGHT_EDGE < b_right <= _INCOMING_AVATAR_MAX_RIGHT_EDGE
                     ):
                         b_top = _measure_bubble_top(rgb, item.box, canvas_lum, is_green=False)
-                        avatar_side = _detect_avatar_side(rgb, b_top, canvas_lum, bottom_limit)
+                        span = (b_left, b_right) if b_right > _INCOMING_MAX_RIGHT_EDGE else None
+                        avatar_side = _detect_avatar_side(rgb, b_top, canvas_lum, bottom_limit, extra_wide_span=span)
+                        if avatar_side == "left_needs_label":
+                            if not _is_white_sticker_caption(rgb, item.box, canvas_lum, bottom_limit):
+                                anchor = Box(b_left, b_top, b_right, item.box.bottom)
+                                needs_sender_label.append((item, anchor))
+                            continue
                     role = classify_bubble_role(
                         b_left,
                         b_right,
@@ -726,6 +746,14 @@ class ChatMessageExtractor:
                     and item.box.right <= _INCOMING_MAX_RIGHT_EDGE
                 ):
                     incoming_items.append(item)
+
+        # OCR order is arbitrary. Match against canvas labels after collecting the whole frame.
+        confirmed_senders: dict[int, str] = {}
+        for item, anchor in needs_sender_label:
+            sender = _find_sender_label(anchor, canvas_labels)
+            if sender:
+                confirmed_senders[id(item)] = sender
+                incoming_items.append(item)
 
         def _overlaps_clipped_group(box: Box) -> bool:
             for cbox in clipped_regions:
@@ -775,7 +803,9 @@ class ChatMessageExtractor:
                 joined = "\n".join(b.text.strip() for b in grp if b.text.strip())
                 sender = ""
                 if role == MessageRole.INCOMING:
-                    sender = _find_sender_label(combined_box, canvas_labels)
+                    sender = next((confirmed_senders[id(line)] for line in grp if id(line) in confirmed_senders), "")
+                    if not sender:
+                        sender = _find_sender_label(combined_box, canvas_labels)
                 mentioned = role == MessageRole.INCOMING and mentions_any_alias(joined, self_aliases)
                 messages.append(
                     ExtractedMessage(
