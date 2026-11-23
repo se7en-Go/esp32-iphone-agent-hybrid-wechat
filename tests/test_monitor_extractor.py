@@ -1,5 +1,10 @@
 """Offline unit tests for M2 group title matching, clipped-bubble filtering, role extraction, and lock screen."""
 
+import io
+
+import pytest
+from PIL import Image, ImageDraw
+
 from tests.fakes import make_collapsed_chat_image
 from wechat_agent.models import Box, OcrBox
 from wechat_agent.monitor.extractor import (
@@ -472,4 +477,76 @@ def test_full_width_incoming_assistivetouch_wide_self_card_and_internal_quote() 
         (MessageRole.SELF, "", "官方商品链接详情标题\n点击卡片查看团购规则说明", False),
         (MessageRole.SELF, "", "已核对活动链接", False),
         (MessageRole.INCOMING, "测试群友B", "请问今天还发货吗？", False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("left_edge", "right_edge", "avatar", "overlay", "expected_incoming"),
+    [
+        (0.164, 0.872, "left", "", True),     # A wide mention just above the input bar
+        (0.164, 0.892, "left", "", True),     # Bubble fill overlaps the right avatar column
+        (0.164, 0.872, "left", "grey", True),
+        (0.164, 0.872, "left_without_label", "", True),
+        (0.164, 0.872, "mono_with_label", "", True),
+        (0.164, 0.872, "mono_without_label", "", False),
+        (0.164, 0.872, "none", "", False),
+        (0.164, 0.872, "right", "", False),
+        (0.164, 0.872, "both", "", False),
+        (0.164, 0.872, "left", "right_ring", False),
+        (0.164, 0.872, "none", "left_ring", False),
+        (0.105, 0.872, "none", "", False),    # Bubble fill overlaps the left avatar column
+        (0.164, 0.960, "left", "", False),    # Surface extends through the avatar gutter
+    ],
+)
+def test_extra_wide_group_mention_needs_an_independent_left_avatar(
+    left_edge: float, right_edge: float, avatar: str, overlay: str, expected_incoming: bool,
+) -> None:
+    w, h = 500, 1000
+    bubble = Box(left_edge, 0.808, right_edge, 0.866)
+    frame = make_collapsed_chat_image(w=w, h=h, incoming_boxes=[bubble])
+    img = Image.open(io.BytesIO(frame)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    if avatar in {"left", "left_without_label", "both", "mono_with_label", "mono_without_label"}:
+        fill = (85, 85, 85) if avatar.startswith("mono") else (65, 115, 175)
+        draw.rectangle((15, 783, 63, 832), fill=fill)
+    if avatar in {"right", "both"}:
+        draw.rectangle((449, 795, 494, 844), fill=(75, 140, 65))
+    if overlay == "grey":
+        draw.ellipse((446, 790, 499, 843), fill=(195, 194, 196))
+    if overlay.endswith("_ring"):
+        x = 4 if overlay == "left_ring" else 446
+        draw.ellipse((x, 790, x + 53, 843), fill=(43, 43, 43))
+        draw.ellipse((x + 12, 802, x + 41, 831), fill=(250, 250, 250))
+
+    png = io.BytesIO()
+    img.save(png, format="PNG")
+    name_bottom = 0.782 if avatar == "mono_with_label" else 0.798
+    name = OcrBox("示例成员", Box(0.164, name_bottom - 0.020, 0.32, name_bottom))
+    question = OcrBox("@测试助手 包裹何时寄出？", Box(left_edge + 0.030, 0.831, 0.816, 0.855))
+    boxes = [question, name] if avatar in {"left", "both", "mono_with_label"} else [question]
+    msgs = ChatMessageExtractor().extract(png.getvalue(), boxes, group_title="测试群", self_aliases=("测试助手",))
+    expected_sender = name.text if len(boxes) == 2 else ""
+    assert [(msg.role, msg.sender, msg.text, msg.mentioned_self) for msg in msgs] == (
+        [(MessageRole.INCOMING, expected_sender, question.text, True)] if expected_incoming else []
+    )
+
+
+def test_extra_wide_wrapped_mention_uses_the_avatar_at_the_top_for_every_line() -> None:
+    bubble = Box(0.164, 0.565, 0.856, 0.685)
+    frame = make_collapsed_chat_image(w=500, h=1000, incoming_boxes=[bubble])
+    img = Image.open(io.BytesIO(frame)).convert("RGB")
+    ImageDraw.Draw(img).rectangle((15, 543, 62, 591), fill=(80, 125, 190))
+    png = io.BytesIO()
+    img.save(png, format="PNG")
+    lines = [
+        OcrBox("@测试助手", Box(0.201, 0.576, 0.805, 0.601)),
+        OcrBox("包装材料", Box(0.201, 0.611, 0.807, 0.636)),
+        OcrBox("可以回收吗？", Box(0.201, 0.646, 0.580, 0.671)),
+    ]
+    name = OcrBox("示例成员", Box(0.164, 0.535, 0.32, 0.555))
+    msgs = ChatMessageExtractor().extract(
+        png.getvalue(), [*lines, name], group_title="测试群", self_aliases=("测试助手",)
+    )
+    assert [(msg.role, msg.sender, msg.text, msg.mentioned_self) for msg in msgs] == [
+        (MessageRole.INCOMING, name.text, "\n".join(line.text for line in lines), True)
     ]
