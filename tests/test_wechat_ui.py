@@ -419,3 +419,69 @@ def test_header_title_excludes_viewport_top_timestamp_and_pure_timestamps() -> N
     assert detect_screen_context(only_timestamp, "示例测试群", allow_group_count=True) != ScreenKind.OTHER_CHAT
 
 
+def test_detect_keyboard_and_verify_pasted_text_5line_dense_chinese_draft() -> None:
+    import io
+
+    from PIL import Image, ImageDraw
+
+    w, h = 500, 1080
+    pill = Box(0.132, 0.432, 0.764, 0.576)
+    adjacent_bubble = Box(0.17, 0.345, 0.72, 0.415)
+    base = make_keyboard_chat_image(
+        w=w,
+        h=h,
+        blue_send=True,
+        with_caret=True,
+        input_box=pill,
+        incoming_boxes=[adjacent_bubble],
+    )
+    img = Image.open(io.BytesIO(base)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # Simulate dense Chinese stroke bands on line 3 (y ~ 0.495..0.502) dipping interior white
+    # pixels below 28% for 4 consecutive rows while leaving left/right white pill padding intact.
+    x_text0 = int(round(0.165 * w))
+    x_text1 = int(round(0.715 * w))
+    for r in range(int(round(0.495 * h)), int(round(0.500 * h))):
+        draw.line([(x_text0, r), (x_text1, r)], fill=(30, 30, 30), width=1)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    img_bytes = buf.getvalue()
+
+    lines = [
+        "发货时间看具体商品的团购",
+        "说明，下单页一般有写，拿",
+        "不准就按群内官方团购链接",
+        "或小程序看下，或问群主确",
+        "认。",
+    ]
+    expected_text = "".join(lines)
+    ocr_boxes = [
+        OcrBox("示例分享·测试3群(198)(12)", Box(0.14, 0.069, 0.846, 0.094)),
+        OcrBox("@良策AI一般下单后几天发货？", Box(0.19, 0.365, 0.70, 0.395)),
+        OcrBox(lines[0], Box(0.162, 0.442, 0.710, 0.463)),
+        OcrBox(lines[1], Box(0.160, 0.468, 0.710, 0.488)),
+        OcrBox(lines[2], Box(0.162, 0.493, 0.710, 0.513)),
+        OcrBox(lines[3], Box(0.160, 0.518, 0.710, 0.538)),
+        OcrBox(lines[4], Box(0.150, 0.539, 0.232, 0.566)),
+        OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+        OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+    ]
+
+    focused = detect_keyboard_and_focused_input(img_bytes, ocr_boxes)
+    assert focused is not None
+    assert focused.input_box.top <= 0.440
+    assert focused.input_box.bottom >= 0.570
+    assert focused.input_box.top > adjacent_bubble.bottom
+
+    ok, observed = verify_pasted_text(
+        ocr_boxes,
+        focused.input_box,
+        expected_text,
+        allow_upward_growth=False,
+    )
+    assert ok is True
+    assert observed == "\n".join(lines)
+
+
