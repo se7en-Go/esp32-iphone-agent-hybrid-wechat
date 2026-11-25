@@ -31,3 +31,6 @@ point_rehome_retries: 1
 
 # 发送前移针（仅 point，不含 click）遇光标闪烁 409 时的最大重试次数
 pre_send_point_retries: 3
+
+# 发送方式：enter（默认，通过受保护键盘 Enter 下发）或 click（鼠标指向点击蓝色「发送」按钮）
+send_method: "enter"

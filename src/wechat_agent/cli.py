@@ -62,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     send_cmd.add_argument("--skill", help="Override skill name (default: wechat-send)")
     send_cmd.add_argument("--ocr", help="Override OCR backend (default: rapidocr)")
+    send_cmd.add_argument(
+        "--send-method",
+        choices=("enter", "click"),
+        help="Override send method after paste verification (default: enter)",
+    )
     send_cmd.add_argument("--cli", help="Override iphone-agent CLI path")
     send_cmd.add_argument("--url", help="Override base server URL")
 
@@ -170,6 +175,7 @@ def _cmd_send(args: argparse.Namespace) -> int:
             allowed_targets_override=args.allow_targets,
             skill_name_override=args.skill,
             ocr_backend_override=args.ocr,
+            send_method_override=args.send_method,
             cli_override=args.cli,
             url_override=args.url,
         )

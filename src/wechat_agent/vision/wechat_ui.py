@@ -683,11 +683,15 @@ def _find_connected_blue_button(rgb: np.ndarray, label_box: Box) -> Box | None:
 def locate_blue_send_button(
     image_bytes: bytes,
     ocr_boxes: list[OcrBox],
+    *,
+    require_blue: bool = False,
 ) -> tuple[Box, str] | None:
     """Locate the lower-right keyboard Send button and expand target_box across the full blue button body.
 
     Strictly avoids overlapping the left space bar key and restricts OCR matching to the lower-right
-    keyboard region (`x >= 0.65, y >= 0.50`). Returns `(button_box, matched_label)` or `None`.
+    keyboard region (`x >= 0.65, y >= 0.50`). When `require_blue=True`, requires connected blue
+    button pixels around the matched Send label rather than falling back to OCR-only bounds.
+    Returns `(button_box, matched_label)` or `None`.
     """
     matches = [
         b
@@ -715,6 +719,8 @@ def locate_blue_send_button(
             min(0.995, blue_box.right),
             min(0.955, blue_box.bottom),
         )
+    elif require_blue:
+        return None
     else:
         # Fallback dynamic expansion around OCR label when blue pixels are absent.
         button_box = Box.clamped(

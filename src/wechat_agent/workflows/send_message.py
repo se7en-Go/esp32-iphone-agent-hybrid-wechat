@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
-from wechat_agent.adapters.driver import DriverError, PhoneDriver
+from wechat_agent.adapters.driver import ConflictError, DriverError, PhoneDriver
 from wechat_agent.config import WeChatSendConfig
 from wechat_agent.evidence import RunEvidence, redact_dict
 from wechat_agent.guards.skill_guard import SkillGuard
@@ -32,6 +32,15 @@ from wechat_agent.vision.wechat_ui import (
 
 from .click_chain import ClickChain, PointerConflictError, PointerNotConfirmedError, SendPreconditionError
 from .navigation import NavigationError, WeChatNavigator
+
+
+def _is_safe_pre_hid_enter_409(exc: ConflictError) -> bool:
+    """Return True ONLY when a 409 conflict definitely occurred before HID write."""
+    if exc.status_code != 409:
+        return False
+    if exc.raw.get("action_may_have_executed") is not False:
+        return False
+    return "screen changed since the original observation" in (exc.detail or "").lower()
 
 
 class SendMessageWorkflow:
@@ -359,20 +368,25 @@ class SendMessageWorkflow:
             )
 
         # 10. Explicit --send path: locate dynamic blue Send button avoiding Space bar
-        send_loc = locate_blue_send_button(post_obs.image_bytes, post_ocr)
+        require_blue_send = self.config.send_method == "enter"
+        send_loc = locate_blue_send_button(
+            post_obs.image_bytes,
+            post_ocr,
+            require_blue=require_blue_send,
+        )
         if send_loc is None:
             return report(
                 SendStatus.ABORTED_SEND_BUTTON,
-                "Could not uniquely locate lower-right Send button on keyboard",
+                "Could not uniquely locate lower-right blue Send button on keyboard",
                 paste_receipt=redacted_receipt,
             )
         send_box, send_label = send_loc
         evidence.log_event(
             "blue_send_button_located",
-            {"label": send_label, "send_box": send_box.as_list()},
+            {"label": send_label, "send_box": send_box.as_list(), "send_method": self.config.send_method},
         )
 
-        # 11. Reserve send slot right before pre-send pointer movement (30s TTL)
+        # 11. Reserve send slot right before send dispatch (30s TTL)
         try:
             prep = self.skill_guard.prepare_send()
         except DriverError as exc:
@@ -395,19 +409,23 @@ class SendMessageWorkflow:
             )
         steps.append("send_slot_reserved")
 
-        # 12. Pre-send pointer move ONLY (allows HTTP 409 caret-blink retry, NEVER clicks)
-        # Re-verify title, pasted text, and Send button dynamically on any fresh re-observed or for_click frame.
-        def _verify_fresh_send_frame(frame_obs: Observation) -> tuple[Box, str, Box | None]:
+        # Re-verify title, pasted text, and Send button dynamically on any fresh frame.
+        def _verify_fresh_send_frame(
+            frame_obs: Observation,
+            *,
+            require_keyboard_and_blue: bool = False,
+            check_no_new_bubble: bool = False,
+        ) -> tuple[Box, str, Box]:
             if not frame_obs.image_bytes:
                 raise SendPreconditionError(
-                    "Empty screenshot frame before Send click; aborting without clicking.",
+                    "Empty screenshot frame before Send; aborting without sending.",
                     status=SendStatus.ABORTED_PASTE_VERIFY,
                 )
             frame_ocr = self.ocr.read_boxes(frame_obs.image_bytes)
             frame_check = self.skill_guard.check_screen_text(frame_ocr)
             if frame_check.stop:
                 raise SendPreconditionError(
-                    f"Circuit breaker triggered before Send click: {frame_check.reason}",
+                    f"Circuit breaker triggered before Send: {frame_check.reason}",
                     status=SendStatus.ABORTED_RISK_PHRASE,
                 )
             if not has_exact_chat_title(
@@ -420,6 +438,11 @@ class SendMessageWorkflow:
                     status=SendStatus.ABORTED_PASTE_VERIFY,
                 )
             focused_now = detect_keyboard_and_focused_input(frame_obs.image_bytes, frame_ocr)
+            if require_keyboard_and_blue and focused_now is None:
+                raise SendPreconditionError(
+                    "Keyboard or focused input box disappeared on fresh pre-send frame",
+                    status=SendStatus.ABORTED_PASTE_VERIFY,
+                )
             fresh_input = focused_now.input_box if focused_now is not None else active_input_box
             ok_text, obs_text = verify_pasted_text(
                 frame_ocr,
@@ -432,7 +455,23 @@ class SendMessageWorkflow:
                     f"Pasted draft drifted on fresh pre-send frame (observed={obs_text!r}, expected={clean_text!r})",
                     status=SendStatus.ABORTED_PASTE_VERIFY,
                 )
-            fresh_send_loc = locate_blue_send_button(frame_obs.image_bytes, frame_ocr)
+            if check_no_new_bubble:
+                current_bubbles = extract_outgoing_bubbles(
+                    frame_obs.image_bytes,
+                    frame_ocr,
+                    chat_area=Box(0.0, 0.13, 1.0, fresh_input.top - 0.01),
+                )
+                if has_new_outgoing_bubble(baseline_bubbles, current_bubbles, clean_text):
+                    raise SendPreconditionError(
+                        "Matching outgoing green bubble already appeared before Enter send; "
+                        "aborting to avoid duplicate send.",
+                        status=SendStatus.SEND_UNCONFIRMED,
+                    )
+            fresh_send_loc = locate_blue_send_button(
+                frame_obs.image_bytes,
+                frame_ocr,
+                require_blue=require_keyboard_and_blue,
+            )
             if fresh_send_loc is None:
                 raise SendPreconditionError(
                     "Blue Send button disappeared on fresh pre-send frame",
@@ -441,94 +480,189 @@ class SendMessageWorkflow:
             fresh_box, fresh_label = fresh_send_loc
             return fresh_box, fresh_label, fresh_input
 
-        evidence.log_event("pre_send_caret_scope", {"caret_scope": active_input_box.as_list()})
-        try:
-            mp, _ = click_chain.pre_send_point_with_caret_retry(
-                send_box.center,
-                send_box,
-                step_name="pre_send_point",
-                max_attempts=self.config.pre_send_point_retries,
-                initial_screen_id=post_obs.screen_id,
-                caret_scope=active_input_box,
-                reverify_observation=_verify_fresh_send_frame,
-            )
-        except SendPreconditionError as exc:
-            return report(
-                exc.status,
-                str(exc),
-                paste_receipt=redacted_receipt,
-            )
-        except PointerNotConfirmedError as exc:
-            return report(
-                SendStatus.ABORTED_POINTER,
-                str(exc),
-                paste_receipt=redacted_receipt,
-            )
-        except DriverError as exc:
-            return report(
-                SendStatus.ABORTED_POINTER,
-                f"Pre-send pointer positioning failed: {exc}",
-                paste_receipt=redacted_receipt,
-            )
-        if click_chain.last_verified_send_box is not None:
-            send_box = click_chain.last_verified_send_box
-        if click_chain.last_verified_send_label:
-            send_label = click_chain.last_verified_send_label
-        if click_chain.last_verified_caret_scope is not None:
-            active_input_box = click_chain.last_verified_caret_scope
-        steps.append("pre_send_pointer_confirmed")
+        post_send_image_bytes = b""
+        if self.config.send_method == "enter":
+            # 12-13 (enter): Fresh observe + hard pre-send verification + single protected key enter
+            max_enter_attempts = 1 + max(0, self.config.enter_send_409_retries)
+            for attempt in range(max_enter_attempts):
+                try:
+                    enter_obs = self.driver.observe(
+                        image_output=evidence.image_output_path(
+                            f"05_pre_enter_{attempt}" if attempt else "05_pre_enter"
+                        )
+                    )
+                except DriverError as exc:
+                    return report(
+                        SendStatus.ABORTED_PASTE_VERIFY,
+                        f"Fresh pre-enter observation failed: {exc}",
+                        paste_receipt=redacted_receipt,
+                    )
+                try:
+                    fresh_box, fresh_label, fresh_input = _verify_fresh_send_frame(
+                        enter_obs,
+                        require_keyboard_and_blue=True,
+                        check_no_new_bubble=True,
+                    )
+                except SendPreconditionError as exc:
+                    return report(
+                        exc.status,
+                        str(exc),
+                        paste_receipt=redacted_receipt,
+                    )
 
-        # 13. Single-shot Send click — re-verifies for_click frame before clicking; NEVER retries click_observed
-        try:
-            send_click_res = click_chain.single_shot_send_click(
-                mp,
-                send_box,
-                send_label,
-                step_name="send_click",
-                caret_scope=active_input_box,
-                verify_for_click=_verify_fresh_send_frame,
-            )
-        except SendPreconditionError as exc:
-            return report(
-                exc.status,
-                str(exc),
-                paste_receipt=redacted_receipt,
-            )
-        except PointerConflictError as exc:
-            return report(
-                SendStatus.ABORTED_POINTER,
-                f"Pre-click observe(--for-click) hit 409 before Send was clicked ({exc}); zero click dispatched.",
-                paste_receipt=redacted_receipt,
-            )
-        except DriverError as exc:
-            return report(
-                SendStatus.SEND_UNCONFIRMED,
-                f"Send click errored ({exc}); click will NOT be retried. Re-observe screen manually.",
-                paste_receipt=redacted_receipt,
-            )
+                evidence.log_event(
+                    "pre_enter_verified",
+                    {
+                        "attempt": attempt,
+                        "screen_id": enter_obs.screen_id,
+                        "send_label": fresh_label,
+                        "send_box": fresh_box.as_list(),
+                        "caret_scope": fresh_input.as_list(),
+                    },
+                )
+                try:
+                    key_res = self.driver.send_enter_key(
+                        screen_id=enter_obs.screen_id,
+                        caret_scope=fresh_input,
+                        image_output=evidence.image_output_path(
+                            f"send_enter_{attempt}" if attempt else "send_enter"
+                        ),
+                    )
+                except ConflictError as exc:
+                    evidence.log_event(
+                        "send_enter_conflict",
+                        {
+                            "attempt": attempt,
+                            "status_code": exc.status_code,
+                            "detail": exc.detail,
+                            "action_may_have_executed": exc.raw.get("action_may_have_executed"),
+                        },
+                    )
+                    if _is_safe_pre_hid_enter_409(exc) and (attempt + 1 < max_enter_attempts):
+                        continue
+                    return report(
+                        SendStatus.SEND_UNCONFIRMED,
+                        f"Protected Enter send conflicted or uncertain ({exc}); refusing to retry.",
+                        paste_receipt=redacted_receipt,
+                    )
+                except DriverError as exc:
+                    return report(
+                        SendStatus.SEND_UNCONFIRMED,
+                        f"Protected Enter send errored ({exc}); refusing to retry.",
+                        paste_receipt=redacted_receipt,
+                    )
 
-        # Explicitly require clicked & command_acknowledged before allowing bubble-scan settlement.
-        if not send_click_res.clicked or not send_click_res.command_acknowledged:
-            evidence.log_event(
-                "send_click_not_acknowledged",
-                {
-                    "clicked": send_click_res.clicked,
-                    "command_acknowledged": send_click_res.command_acknowledged,
-                },
-            )
-            return report(
-                SendStatus.SEND_UNCONFIRMED,
-                f"Send click was not acknowledged by driver "
-                f"(clicked={send_click_res.clicked}, command_acknowledged={send_click_res.command_acknowledged}); "
-                "refusing to settle as sent or retry.",
-                paste_receipt=redacted_receipt,
-            )
-        steps.append("send_click_dispatched")
+                evidence.log_event(
+                    "send_enter_executed",
+                    {
+                        "attempt": attempt,
+                        "command_acknowledged": key_res.command_acknowledged,
+                        "action_may_have_executed": key_res.action_may_have_executed,
+                        "caret_scope": fresh_input.as_list(),
+                    },
+                )
+                if not key_res.command_acknowledged:
+                    return report(
+                        SendStatus.SEND_UNCONFIRMED,
+                        "Protected Enter send was not acknowledged by driver "
+                        f"(action_may_have_executed={key_res.action_may_have_executed}); "
+                        "refusing to settle as sent or retry.",
+                        paste_receipt=redacted_receipt,
+                    )
+                steps.append("send_enter_dispatched")
+                post_send_image_bytes = key_res.image_bytes
+                break
+        else:
+            # 12 (click): Pre-send pointer move ONLY (allows HTTP 409 caret-blink retry, NEVER clicks)
+            evidence.log_event("pre_send_caret_scope", {"caret_scope": active_input_box.as_list()})
+            try:
+                mp, _ = click_chain.pre_send_point_with_caret_retry(
+                    send_box.center,
+                    send_box,
+                    step_name="pre_send_point",
+                    max_attempts=self.config.pre_send_point_retries,
+                    initial_screen_id=post_obs.screen_id,
+                    caret_scope=active_input_box,
+                    reverify_observation=_verify_fresh_send_frame,
+                )
+            except SendPreconditionError as exc:
+                return report(
+                    exc.status,
+                    str(exc),
+                    paste_receipt=redacted_receipt,
+                )
+            except PointerNotConfirmedError as exc:
+                return report(
+                    SendStatus.ABORTED_POINTER,
+                    str(exc),
+                    paste_receipt=redacted_receipt,
+                )
+            except DriverError as exc:
+                return report(
+                    SendStatus.ABORTED_POINTER,
+                    f"Pre-send pointer positioning failed: {exc}",
+                    paste_receipt=redacted_receipt,
+                )
+            if click_chain.last_verified_send_box is not None:
+                send_box = click_chain.last_verified_send_box
+            if click_chain.last_verified_send_label:
+                send_label = click_chain.last_verified_send_label
+            if click_chain.last_verified_caret_scope is not None:
+                active_input_box = click_chain.last_verified_caret_scope
+            steps.append("pre_send_pointer_confirmed")
+
+            # 13 (click): Single-shot Send click — re-verifies for_click frame; NEVER retries click_observed
+            try:
+                send_click_res = click_chain.single_shot_send_click(
+                    mp,
+                    send_box,
+                    send_label,
+                    step_name="send_click",
+                    caret_scope=active_input_box,
+                    verify_for_click=_verify_fresh_send_frame,
+                )
+            except SendPreconditionError as exc:
+                return report(
+                    exc.status,
+                    str(exc),
+                    paste_receipt=redacted_receipt,
+                )
+            except PointerConflictError as exc:
+                return report(
+                    SendStatus.ABORTED_POINTER,
+                    f"Pre-click observe(--for-click) hit 409 before Send was clicked ({exc}); zero click dispatched.",
+                    paste_receipt=redacted_receipt,
+                )
+            except DriverError as exc:
+                return report(
+                    SendStatus.SEND_UNCONFIRMED,
+                    f"Send click errored ({exc}); click will NOT be retried. Re-observe screen manually.",
+                    paste_receipt=redacted_receipt,
+                )
+
+            # Explicitly require clicked & command_acknowledged before allowing bubble-scan settlement.
+            if not send_click_res.clicked or not send_click_res.command_acknowledged:
+                evidence.log_event(
+                    "send_click_not_acknowledged",
+                    {
+                        "clicked": send_click_res.clicked,
+                        "command_acknowledged": send_click_res.command_acknowledged,
+                    },
+                )
+                return report(
+                    SendStatus.SEND_UNCONFIRMED,
+                    f"Send click was not acknowledged by driver "
+                    f"(clicked={send_click_res.clicked}, command_acknowledged={send_click_res.command_acknowledged}); "
+                    "refusing to settle as sent or retry.",
+                    paste_receipt=redacted_receipt,
+                )
+            steps.append("send_click_dispatched")
+            post_send_image_bytes = send_click_res.image_bytes
 
         # 14. Post-send verification: must see exact target title AND a NEW green outgoing bubble
         try:
-            if send_click_res.image_bytes:
-                final_bytes = send_click_res.image_bytes
+            if post_send_image_bytes:
+                final_bytes = post_send_image_bytes
             else:
                 after_obs = self.driver.observe(image_output=evidence.image_output_path("05_post_send"))
                 final_bytes = after_obs.image_bytes

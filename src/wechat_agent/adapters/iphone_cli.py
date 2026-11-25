@@ -14,6 +14,7 @@ from typing import Any
 from wechat_agent.models import (
     Box,
     ClickResult,
+    KeyActionResult,
     MeasuredPointer,
     Observation,
     PasteFlowResult,
@@ -342,6 +343,48 @@ class IphoneAgentCliDriver:
             command_acknowledged=bool(payload.get("command_acknowledged", False)),
             effect_verified=bool(payload.get("effect_verified", False)),
             changed=payload.get("changed"),
+            image_bytes=img_bytes,
+            image_path=img_path,
+            raw=payload,
+        )
+
+    def send_enter_key(
+        self,
+        *,
+        screen_id: str,
+        caret_scope: Box,
+        image_output: Path | None = None,
+    ) -> KeyActionResult:
+        """Dispatch a protected keyboard Enter action without `enter_intent` (consumes send reservation)."""
+        if not isinstance(screen_id, str) or not screen_id.strip():
+            raise ValueError("send_enter_key requires a non-empty screen_id")
+        # Intentionally omit `enter_intent` so base guard.py enforces prepare-send reservation & circuit breaker.
+        action_payload: dict[str, Any] = {
+            "action": "key",
+            "text": "enter",
+            "screen_id": screen_id,
+            "caret_scope": [
+                round(caret_scope.left, 6),
+                round(caret_scope.top, 6),
+                round(caret_scope.right, 6),
+                round(caret_scope.bottom, 6),
+            ],
+        }
+        args = ["action", json.dumps(action_payload, ensure_ascii=False, separators=(",", ":"))]
+        if image_output is not None:
+            image_output.parent.mkdir(parents=True, exist_ok=True)
+            args.extend(["--image-output", str(image_output)])
+        payload = self._run_json(args)
+        img_bytes, img_path = _extract_image_bytes(payload, image_output)
+        raw_may = payload.get("action_may_have_executed")
+        may_exec = raw_may if isinstance(raw_may, bool) else None
+        return KeyActionResult(
+            screen_id=payload.get("screen_id"),
+            command_acknowledged=bool(payload.get("command_acknowledged", False)),
+            action_may_have_executed=may_exec,
+            effect_verified=bool(payload.get("effect_verified", False)),
+            changed=payload.get("changed"),
+            error=str(payload.get("error") or ""),
             image_bytes=img_bytes,
             image_path=img_path,
             raw=payload,
