@@ -1203,3 +1203,75 @@ def test_send_method_config_validation_and_defaults(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="send_method"):
         load_monitor_config(bad_yaml)
 
+
+def test_enter_send_recovers_short_tail_occluded_by_green_caret_via_crop_fallback(tmp_path: Path) -> None:
+    from wechat_agent.vision.wechat_ui import detect_keyboard_and_focused_input, prepare_input_box_ocr_crop
+
+    msg = "一般发货前能在官方小程序的订单详情里改地址，看有没有修改入口，改不了找群主确认下。"
+    pill = Box(0.132, 0.528, 0.764, 0.576)
+
+    # Part A: Full-frame post_paste passes; fresh 05_pre_enter frame drops '下。' next to green caret,
+    # while caret-masked 2x crop recovers full text -> send_enter_key runs and settles SENT_CONFIRMED.
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    frames = _register_happy_chat_flow(driver, ocr, message_text=msg)
+
+    pre_enter_img = make_keyboard_chat_image(blue_send=True, with_caret=True, input_box=pill) + b"pre_enter_caret"
+    pre_enter_truncated_boxes = [
+        OcrBox("文件传输助手", Box(0.35, 0.06, 0.65, 0.09)),
+        OcrBox(
+            "一般发货前能在官方小程序的订单详情里改地址，看有没有修改入口，改不了找群主确认",
+            Box(0.158, 0.535, 0.710, 0.562),
+        ),
+        OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+        OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+    ]
+    ocr.register(pre_enter_img, pre_enter_truncated_boxes)
+    focused = detect_keyboard_and_focused_input(pre_enter_img, pre_enter_truncated_boxes)
+    assert focused is not None
+    prepared = prepare_input_box_ocr_crop(pre_enter_img, focused.input_box, allow_upward_growth=False)
+    assert prepared is not None
+    crop_bytes, _ = prepared
+    ocr.register(
+        crop_bytes,
+        [
+            OcrBox(msg, Box(0.08, 0.25, 0.88, 0.78)),
+        ],
+    )
+
+    driver.observe_queue = [
+        Observation(screen_id="scr-kb", image_bytes=frames["focused_empty"]),
+        Observation(screen_id="scr-pasted", image_bytes=frames["pasted"]),
+        Observation(screen_id="scr-pe", image_bytes=pre_enter_img),
+    ]
+    driver.key_action_handler = lambda sid, scope: KeyActionResult(
+        screen_id="scr-sent",
+        command_acknowledged=True,
+        action_may_have_executed=True,
+        image_bytes=frames["sent"],
+    )
+    rep = SendMessageWorkflow(driver, ocr, _config(tmp_path)).run("文件传输助手", msg, send=True)
+    assert rep.status == SendStatus.SENT_CONFIRMED
+    assert len([c for c in driver.calls if c[0] == "send_enter_key"]) == 1
+
+    # Part B: When fallback crop ALSO reflects a genuinely missing tail -> MUST abort ABORTED_PASTE_VERIFY.
+    driver2 = FakePhoneDriver()
+    ocr2 = MockOcrEngine()
+    frames2 = _register_happy_chat_flow(driver2, ocr2, message_text=msg)
+    ocr2.register(pre_enter_img, pre_enter_truncated_boxes)
+    ocr2.register(
+        crop_bytes,
+        [
+            OcrBox(msg[:-2], Box(0.08, 0.25, 0.86, 0.78)),
+        ],
+    )
+    driver2.observe_queue = [
+        Observation(screen_id="scr-kb2", image_bytes=frames2["focused_empty"]),
+        Observation(screen_id="scr-pasted2", image_bytes=frames2["pasted"]),
+        Observation(screen_id="scr-pe2", image_bytes=pre_enter_img),
+    ]
+    rep2 = SendMessageWorkflow(driver2, ocr2, _config(tmp_path)).run("文件传输助手", msg, send=True)
+    assert rep2.status == SendStatus.ABORTED_PASTE_VERIFY
+    assert len([c for c in driver2.calls if c[0] == "send_enter_key"]) == 0
+
+

@@ -28,7 +28,9 @@ from .wechat_ui import (
     locate_blue_send_button,
     locate_collapsed_input_box,
     outgoing_bubble_matches,
+    prepare_input_box_ocr_crop,
     verify_pasted_text,
+    verify_pasted_text_with_fallback,
 )
 
 __all__ = [
@@ -60,5 +62,7 @@ __all__ = [
     "locate_collapsed_input_box",
     "normalize_text",
     "outgoing_bubble_matches",
+    "prepare_input_box_ocr_crop",
     "verify_pasted_text",
+    "verify_pasted_text_with_fallback",
 ]

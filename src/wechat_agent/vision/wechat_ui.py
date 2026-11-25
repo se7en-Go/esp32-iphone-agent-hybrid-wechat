@@ -21,6 +21,7 @@ from .geometry import (
     derive_home_icon_body_box,
     normalize_text,
 )
+from .ocr import OcrEngine, OcrError
 
 SEND_LABELS = ("发送", "發送", "Send")
 SEND_SEARCH_REGION = Box(0.65, 0.50, 1.0, 0.96)
@@ -638,6 +639,118 @@ def verify_pasted_text(
             return False, observed_raw
 
     return True, observed_raw
+
+
+def prepare_input_box_ocr_crop(
+    image_bytes: bytes,
+    input_box: Box,
+    *,
+    allow_upward_growth: bool = False,
+    scale: int = 2,
+) -> tuple[bytes, Box] | None:
+    """Crop the input region, mask the bright green WeChat caret to white, and upscale for fallback OCR."""
+    rgb = _decode_rgb(image_bytes)
+    if rgb is None:
+        return None
+    h, w, _ = rgb.shape
+    top_margin = 0.14 if allow_upward_growth else 0.015
+    paste_region = Box.clamped(
+        input_box.left - 0.015,
+        max(0.18, input_box.top - top_margin),
+        input_box.right + 0.015,
+        min(0.72, input_box.bottom + 0.015),
+    )
+    x0, y0, x1, y1 = _norm_box_to_pixels(paste_region, w, h)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+
+    aligned_box = Box.clamped(x0 / w, y0 / h, x1 / w, y1 / h)
+    patch = rgb[y0:y1, x0:x1].copy()
+
+    # Mask the bright green WeChat caret only strictly inside `input_box` so nearby chat bubbles stay untouched.
+    ix0, iy0, ix1, iy1 = _norm_box_to_pixels(input_box, w, h)
+    px0 = max(0, ix0 - x0)
+    py0 = max(0, iy0 - y0)
+    px1 = min(x1 - x0, ix1 - x0)
+    py1 = min(y1 - y0, iy1 - y0)
+    if px1 > px0 and py1 > py0:
+        sub = patch[py0:py1, px0:px1]
+        sub_i = sub.astype(np.int16)
+        green_caret = (
+            (sub_i[:, :, 1] - sub_i[:, :, 0] >= 35)
+            & (sub_i[:, :, 1] - sub_i[:, :, 2] >= 20)
+            & (sub_i[:, :, 1] >= 100)
+        )
+        sub[green_caret] = 255
+
+    factor = max(1, int(scale))
+    crop_img = Image.fromarray(patch)
+    if factor > 1:
+        crop_img = crop_img.resize((crop_img.width * factor, crop_img.height * factor), Image.Resampling.BICUBIC)
+    buf = io.BytesIO()
+    crop_img.save(buf, format="PNG")
+    return buf.getvalue(), aligned_box
+
+
+def verify_pasted_text_with_fallback(
+    ocr: OcrEngine,
+    image_bytes: bytes,
+    ocr_boxes: list[OcrBox],
+    input_box: Box,
+    expected_text: str,
+    *,
+    allow_upward_growth: bool = False,
+) -> tuple[bool, str]:
+    """Verify pasted text on `ocr_boxes`, retrying once on a caret-masked 2x input-box crop on mismatch."""
+    ok, obs = verify_pasted_text(
+        ocr_boxes,
+        input_box,
+        expected_text,
+        allow_upward_growth=allow_upward_growth,
+    )
+    if ok or not image_bytes:
+        return ok, obs
+
+    prepared = prepare_input_box_ocr_crop(
+        image_bytes,
+        input_box,
+        allow_upward_growth=allow_upward_growth,
+    )
+    if prepared is None:
+        return False, obs
+
+    crop_bytes, crop_box = prepared
+    try:
+        crop_boxes = ocr.read_boxes(crop_bytes)
+    except OcrError:
+        return False, obs
+    if not crop_boxes:
+        return False, obs
+
+    cw = crop_box.width
+    ch = crop_box.height
+    mapped = [
+        OcrBox(
+            text=item.text,
+            box=Box.clamped(
+                crop_box.left + item.box.left * cw,
+                crop_box.top + item.box.top * ch,
+                crop_box.left + item.box.right * cw,
+                crop_box.top + item.box.bottom * ch,
+            ),
+            confidence=item.confidence,
+        )
+        for item in crop_boxes
+    ]
+    crop_ok, crop_obs = verify_pasted_text(
+        mapped,
+        input_box,
+        expected_text,
+        allow_upward_growth=allow_upward_growth,
+    )
+    if crop_ok:
+        return True, crop_obs
+    return False, obs
 
 
 def _find_space_bar_right_edge(ocr_boxes: list[OcrBox]) -> float:

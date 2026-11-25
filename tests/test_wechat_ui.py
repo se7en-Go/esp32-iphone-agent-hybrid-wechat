@@ -25,7 +25,9 @@ from wechat_agent.vision.wechat_ui import (
     has_new_outgoing_bubble,
     locate_blue_send_button,
     locate_collapsed_input_box,
+    prepare_input_box_ocr_crop,
     verify_pasted_text,
+    verify_pasted_text_with_fallback,
 )
 
 
@@ -576,6 +578,96 @@ def test_verify_pasted_text_punctuation_tolerance_keeps_content_strict() -> None
         )[0]
         is False
     )
+
+
+def test_prepare_input_box_ocr_crop_masks_green_caret_and_fallback_recovers_short_tail() -> None:
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    from tests.fakes import MockOcrEngine
+
+    pill = Box(0.132, 0.408, 0.764, 0.576)
+    outgoing_above = Box(0.30, 0.25, 0.85, 0.35)
+    img_bytes = make_keyboard_chat_image(
+        blue_send=True,
+        with_caret=True,
+        input_box=pill,
+        outgoing_boxes=[outgoing_above],
+    )
+    prepared = prepare_input_box_ocr_crop(img_bytes, pill, allow_upward_growth=False)
+    assert prepared is not None
+    crop_bytes, crop_box = prepared
+    with Image.open(io.BytesIO(crop_bytes)) as crop_img:
+        arr = np.asarray(crop_img.convert("RGB"), dtype=np.int16)
+        assert crop_img.width >= int(round(crop_box.width * 480 * 2)) - 2
+    # All bright green caret pixels inside `input_box` are masked to white (no green excess remains).
+    green_excess = (arr[:, :, 1] - arr[:, :, 0] >= 35) & (arr[:, :, 1] - arr[:, :, 2] >= 20) & (arr[:, :, 1] >= 100)
+    assert int(green_excess.sum()) == 0
+
+    expected = (
+        "一般发货前能在官方小程序的订单详情里改地址，你翻下有没有修改入口；"
+        "改不了就赶紧找群主或官方客服说明订单号，让他们帮忙拦一下。"
+    )
+    truncated_full_boxes = [
+        OcrBox("一般发货前能在官方小程序", Box(0.158, 0.416, 0.710, 0.440)),
+        OcrBox("的订单详情里改地址，你翻", Box(0.160, 0.442, 0.710, 0.463)),
+        OcrBox("下有没有修改入口；改不了", Box(0.164, 0.469, 0.706, 0.487)),
+        OcrBox("就赶紧找群主或官方客服说", Box(0.164, 0.494, 0.708, 0.513)),
+        OcrBox("明订单号，让他们帮忙拦一", Box(0.158, 0.517, 0.708, 0.540)),
+    ]
+
+    # Case 1: Full-frame OCR drops 2-char tail '下。' next to green caret; fallback crop recovers all 6 lines.
+    ocr = MockOcrEngine()
+    ocr.register(
+        crop_bytes,
+        [
+            OcrBox("一般发货前能在官方小程序", Box(0.08, 0.08, 0.88, 0.21)),
+            OcrBox("的订单详情里改地址，你翻", Box(0.08, 0.22, 0.88, 0.34)),
+            OcrBox("下有没有修改入口；改不了", Box(0.08, 0.35, 0.88, 0.47)),
+            OcrBox("就赶紧找群主或官方客服说", Box(0.08, 0.48, 0.88, 0.60)),
+            OcrBox("明订单号，让他们帮忙拦一", Box(0.08, 0.61, 0.88, 0.74)),
+            OcrBox("下。", Box(0.07, 0.75, 0.20, 0.89)),
+        ],
+    )
+    ok, obs = verify_pasted_text_with_fallback(ocr, img_bytes, truncated_full_boxes, pill, expected)
+    assert ok is True
+    assert obs.endswith("下。")
+
+    # Case 2: Genuine missing tail in fallback crop MUST stay rejected.
+    ocr_missing = MockOcrEngine()
+    ocr_missing.register(
+        crop_bytes,
+        [
+            OcrBox("一般发货前能在官方小程序", Box(0.08, 0.08, 0.88, 0.21)),
+            OcrBox("的订单详情里改地址，你翻", Box(0.08, 0.22, 0.88, 0.34)),
+            OcrBox("下有没有修改入口；改不了", Box(0.08, 0.35, 0.88, 0.47)),
+            OcrBox("就赶紧找群主或官方客服说", Box(0.08, 0.48, 0.88, 0.60)),
+            OcrBox("明订单号，让他们帮忙拦一", Box(0.08, 0.61, 0.88, 0.74)),
+        ],
+    )
+    ok_missing, obs_missing = verify_pasted_text_with_fallback(
+        ocr_missing, img_bytes, truncated_full_boxes, pill, expected
+    )
+    assert ok_missing is False
+    assert obs_missing.endswith("拦一")
+
+    # Case 3: Duplicated paste in fallback crop MUST stay rejected.
+    ocr_dup = MockOcrEngine()
+    ocr_dup.register(
+        crop_bytes,
+        [
+            OcrBox("一般发货前能在官方小程序", Box(0.08, 0.08, 0.88, 0.21)),
+            OcrBox("的订单详情里改地址，你翻", Box(0.08, 0.22, 0.88, 0.34)),
+            OcrBox("下有没有修改入口；改不了", Box(0.08, 0.35, 0.88, 0.47)),
+            OcrBox("就赶紧找群主或官方客服说", Box(0.08, 0.48, 0.88, 0.60)),
+            OcrBox("明订单号，让他们帮忙拦一", Box(0.08, 0.61, 0.88, 0.74)),
+            OcrBox("下。" + expected, Box(0.07, 0.75, 0.90, 0.89)),
+        ],
+    )
+    assert verify_pasted_text_with_fallback(ocr_dup, img_bytes, truncated_full_boxes, pill, expected)[0] is False
+
 
 
 
