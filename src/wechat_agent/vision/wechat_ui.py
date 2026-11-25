@@ -867,7 +867,13 @@ def extract_outgoing_bubbles(
     return ["\n".join(part.text.strip() for part in grp if part.text.strip()) for grp in grouped]
 
 
-def _outgoing_bubble_matches(observed_text: str, expected_text: str) -> bool:
+def outgoing_bubble_matches(observed_text: str, expected_text: str) -> bool:
+    """Return True if an observed outgoing bubble text matches `expected_text` across OCR jitter.
+
+    Accepts exact normalized text, punctuation-stripped normalized equality (preserving decimal
+    dots), >= 85% edge-truncation containment for long replies (>= 10 canonical chars), and
+    SequenceMatcher >= 0.92 similarity on punctuation-stripped long replies (>= 12 chars).
+    """
     canon_obs = _canonical_text(observed_text)
     canon_exp = _canonical_text(expected_text)
     if not canon_obs or not canon_exp:
@@ -900,6 +906,6 @@ def has_new_outgoing_bubble(
     """Confirm that a genuinely NEW outgoing bubble matching `expected_text` appeared after Send."""
     if not _canonical_text(expected_text) or not current_bubbles:
         return False
-    base_matches = sum(1 for b in baseline_bubbles if _outgoing_bubble_matches(b, expected_text))
-    curr_matches = sum(1 for b in current_bubbles if _outgoing_bubble_matches(b, expected_text))
+    base_matches = sum(1 for b in baseline_bubbles if outgoing_bubble_matches(b, expected_text))
+    curr_matches = sum(1 for b in current_bubbles if outgoing_bubble_matches(b, expected_text))
     return curr_matches > base_matches

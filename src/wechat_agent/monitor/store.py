@@ -6,7 +6,6 @@ import errno
 import hashlib
 import json
 import os
-import re
 import sqlite3
 import time
 from collections.abc import Sequence
@@ -22,6 +21,7 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 from wechat_agent.evidence import redact_dict
 from wechat_agent.vision.geometry import canonicalize_chat_title, normalize_text
+from wechat_agent.vision.wechat_ui import outgoing_bubble_matches
 
 from .extractor import (
     LegacyViewportItem,
@@ -668,12 +668,11 @@ class MonitorStore:
     def claim_bot_reply_match(self, group_title: str, text: str, *, since_ts: float) -> bool:
         """Consume an unacknowledged `sent_confirmed` bot reply matching `text` to avoid false takeover.
 
-        Requires exact normalized equality, or — for long replies (>= 10 canonical chars) — a
-        high-ratio (>= 85%) containment match to tolerate minor single-edge OCR truncation without
-        ever allowing a human message containing a short bot reply (e.g. "好的") to swallow the match.
+        Delegates matching to `outgoing_bubble_matches` (the single source of truth shared with
+        `has_new_outgoing_bubble`) so OCR punctuation drops or minor long-reply jitter never cause
+        false human-takeover triggers while still rejecting short-substring or wrong-text matches.
         """
-        canon = re.sub(r"\s+", "", normalize_text(text))
-        if not canon:
+        if not normalize_text(text):
             return False
         norm_group = canonicalize_chat_title(group_title)
         rows = self._conn.execute(
@@ -685,15 +684,10 @@ class MonitorStore:
             (norm_group, float(since_ts)),
         ).fetchall()
         for row in rows:
-            row_canon = re.sub(r"\s+", "", normalize_text(str(row["reply_text"] or "")))
-            if not row_canon:
+            expected_reply = str(row["reply_text"] or "")
+            if not expected_reply:
                 continue
-            matched = row_canon == canon
-            if not matched and len(row_canon) >= 10 and len(canon) >= 10:
-                ratio = min(len(row_canon), len(canon)) / max(len(row_canon), len(canon))
-                if ratio >= 0.85 and (row_canon in canon or canon in row_canon):
-                    matched = True
-            if matched:
+            if outgoing_bubble_matches(text, expected_reply):
                 with self._conn:
                     self._conn.execute(
                         "UPDATE reply_history SET status = 'sent_confirmed_seen' WHERE id = ?",

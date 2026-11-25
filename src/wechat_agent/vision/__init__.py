@@ -27,6 +27,7 @@ from .wechat_ui import (
     is_lock_screen,
     locate_blue_send_button,
     locate_collapsed_input_box,
+    outgoing_bubble_matches,
     verify_pasted_text,
 )
 
@@ -58,5 +59,6 @@ __all__ = [
     "locate_blue_send_button",
     "locate_collapsed_input_box",
     "normalize_text",
+    "outgoing_bubble_matches",
     "verify_pasted_text",
 ]
