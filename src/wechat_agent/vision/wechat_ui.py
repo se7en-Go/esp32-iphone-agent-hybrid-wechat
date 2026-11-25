@@ -378,8 +378,35 @@ def _extract_input_pill_box(rgb: np.ndarray, scan_box: Box) -> Box | None:
             merged.append(run)
 
     best = max(merged, key=lambda r: r[1] - r[0])
-    left = (x0 + best[0]) / w
-    right = (x0 + best[1]) / w
+    c0, c1 = best
+    pill_w = c1 - c0
+    inset = 1 if pill_w < 40 else 2
+    margin_w = max(2, min(10, pill_w // 25))
+
+    def _row_belongs_to_pill(r: int) -> bool:
+        row_slice = mask[r, c0:c1]
+        if row_slice.size == 0:
+            return False
+        interior_white = float(row_slice.mean())
+        if r in active_set and interior_white >= 0.20:
+            return True
+        left_border = float(mask[r, c0 + inset : min(c1, c0 + inset + margin_w)].mean())
+        right_border = float(mask[r, max(c0, c1 - inset - margin_w) : c1 - inset].mean())
+        return left_border >= 0.60 and right_border >= 0.60 and interior_white >= 0.12
+
+    # Pass 2: Extend upward across dense multi-line text rows whenever the pill's left/right
+    # white margins stay continuous, stopping immediately at the grey toolbar border above.
+    while start_r > 0:
+        nxt = start_r - 1
+        if _row_belongs_to_pill(nxt):
+            start_r = nxt
+        elif nxt > 0 and _row_belongs_to_pill(nxt - 1) and float(mask[nxt, c0:c1].mean()) >= 0.08:
+            start_r = nxt - 1
+        else:
+            break
+
+    left = (x0 + c0) / w
+    right = (x0 + c1) / w
     top = (y0 + start_r) / h
     bottom = (y0 + end_r + 1) / h
     if (right - left) >= 0.25 and 0.02 <= (bottom - top) <= 0.26:
