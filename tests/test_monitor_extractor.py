@@ -550,3 +550,120 @@ def test_extra_wide_wrapped_mention_uses_the_avatar_at_the_top_for_every_line() 
     assert [(msg.role, msg.sender, msg.text, msg.mentioned_self) for msg in msgs] == [
         (MessageRole.INCOMING, name.text, "\n".join(line.text for line in lines), True)
     ]
+
+
+def test_viewport_alignment_tolerates_punctuation_and_ocr_jitter_without_replaying_self_bubble() -> None:
+    # Exact reproduction of the live group incident:
+    # 4-line self bubble lost one trailing comma after scrolling up, which previously broke k=4
+    # overlap and fell back to k=1 on a repeated historical question, replaying the old self bubble.
+    prev = [
+        ("incoming", "", "腾讯云", 1),
+        ("incoming", "", "微信小店助手", 1),
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货?", 1),
+        ("incoming", "Lee.", "@良策AI请问团购包邮吗?", 1),
+        (
+            "self",
+            "",
+            "这个看具体商品的团购说明, 运费一般写在下单页,按群内 官方团购链接或小程序看下, 拿不准就问群主确认。",
+            1,
+        ),
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货?", 2),
+    ]
+    curr = [
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货?", 1),
+        ("incoming", "Lee.", "@良策AI请问团购包邮吗?", 1),
+        (
+            "self",
+            "",
+            "这个看具体商品的团购说明 运费一般写在下单页,按群内 官方团购链接或小程序看下, 拿不准就问群主确认。",
+            1,
+        ),
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货?", 2),
+        ("incoming", "Lee.", "@良策AI支持7天无理由退款吗?", 1),
+    ]
+
+    alignment = align_viewport_suffix(prev, curr)
+    assert alignment == ViewportAlignment("aligned", 4, 4)
+    assert curr[alignment.new_start :] == [("incoming", "Lee.", "@良策AI支持7天无理由退款吗?", 1)]
+
+
+def test_viewport_alignment_long_bubble_glyph_jitter_and_distinct_questions() -> None:
+    prev = [
+        ("incoming", "Lee.", "@良策AI请问团购包邮吗？", 1),
+        ("self", "", "这个看具体商品的团购说明，运费一般写在下单页，拿不准就问群主确认。", 1),
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货？", 1),
+    ]
+    # 1-char OCR glyph flicker on long self bubble (ratio >= 0.92) still aligns k=3
+    curr_jitter = [
+        ("incoming", "Lee.", "@良策AI请问团购包邮吗？", 1),
+        ("self", "", "这个看具体商品的团购说明，运费一般写在下单页，拿不准就问群主确队。", 1),
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货？", 1),
+        ("incoming", "Lee.", "@良策AI有优惠券吗？", 1),
+    ]
+    assert align_viewport_suffix(prev, curr_jitter) == ViewportAlignment("aligned", 3, 3)
+
+    # Distinct similar-looking questions ("付款后多久发货" vs "下单后怎么发货") MUST NOT falsely merge
+    from wechat_agent.monitor.extractor import _viewport_text_matches
+
+    assert _viewport_text_matches("@良策AI团购付款后多久发货？", "@良策AI团购下单后怎么发货？") is False
+    curr_distinct = [
+        ("self", "", "这个看具体商品的团购说明，运费一般写在下单页，拿不准就问群主确认。", 1),
+        ("incoming", "Lee.", "@良策AI团购下单后怎么发货？", 1),
+    ]
+    al_distinct = align_viewport_suffix(prev, curr_distinct)
+    assert al_distinct == ViewportAlignment("discontinuity", 0, 2)
+
+
+def test_viewport_alignment_recovers_middle_occlusion_and_blocks_ambiguous_k1_duplicate() -> None:
+    # Middle-item heavy corruption/occlusion (e.g., AssistiveTouch obscures part of self bubble)
+    prev = [
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货？", 1),
+        ("incoming", "Lee.", "@良策AI请问团购包邮吗？", 1),
+        (
+            "self",
+            "",
+            "这个看具体商品的团购说明，运费一般写在下单页，按群内官方团购链接或小程序看下，拿不准就问群主确认。",
+            1,
+        ),
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货？", 2),
+    ]
+    curr_corrupted_mid = [
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货？", 1),
+        ("incoming", "Lee.", "@良策AI请问团购包邮吗？", 1),
+        ("self", "", "完全被遮挡识别乱码ABC123", 1),
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货？", 2),
+        ("incoming", "Lee.", "@良策AI怎么联系售后？", 1),
+    ]
+    al_mid = align_viewport_suffix(prev, curr_corrupted_mid)
+    assert al_mid.kind == "aligned"
+    assert al_mid.new_start == 4
+    assert curr_corrupted_mid[al_mid.new_start :] == [("incoming", "Lee.", "@良策AI怎么联系售后？", 1)]
+
+    # Ambiguous k=1 duplicate guard: prev[-1] is occurrence=2 and also appears later in curr[1:],
+    # with unrelated middle item (not enough subsequence overlap) -> MUST NOT fall back to k=1 and replay!
+    prev_dup = [
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货？", 1),
+        ("self", "", "历史回复正文完全不一样的内容", 1),
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货？", 2),
+    ]
+    curr_dup = [
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货？", 1),
+        ("self", "", "另一段完全无关的中间消息", 1),
+        ("incoming", "Lee.", "@良策AI团购付款后多久发货？", 2),
+        ("incoming", "Lee.", "@良策AI新品什么时候上架？", 1),
+    ]
+    al_dup = align_viewport_suffix(prev_dup, curr_dup)
+    assert al_dup.kind == "discontinuity"
+    assert not (al_dup.kind == "aligned" and al_dup.new_start == 1)
+
+    # Scroll-up / keyboard-covered subset with punctuation jitter must still classify as scroll_up
+    curr_scroll = [
+        ("incoming", "Lee.", "@良策AI请问团购包邮吗", 1),
+        (
+            "self",
+            "",
+            "这个看具体商品的团购说明 运费一般写在下单页 按群内官方团购链接或小程序看下 拿不准就问群主确认",
+            1,
+        ),
+    ]
+    assert align_viewport_suffix(prev, curr_scroll) == ViewportAlignment("scroll_up", 2, 2)
