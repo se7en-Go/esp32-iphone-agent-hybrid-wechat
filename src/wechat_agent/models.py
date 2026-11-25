@@ -169,6 +169,19 @@ class ClickResult:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class KeyActionResult:
+    screen_id: str | None
+    command_acknowledged: bool = False
+    action_may_have_executed: bool | None = None
+    effect_verified: bool = False
+    changed: bool | None = None
+    error: str = ""
+    image_bytes: bytes = b""
+    image_path: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
 class PasteRecoveryState(str, Enum):
     COMPLETED = "completed"
     NOT_COPIED = "not_copied"

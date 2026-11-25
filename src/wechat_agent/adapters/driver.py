@@ -8,6 +8,7 @@ from typing import Any, Protocol, runtime_checkable
 from wechat_agent.models import (
     Box,
     ClickResult,
+    KeyActionResult,
     Observation,
     PasteFlowResult,
     PointResult,
@@ -92,6 +93,14 @@ class PhoneDriver(Protocol):
         caret_scope: Box | None = None,
         image_output: Path | None = None,
     ) -> ClickResult: ...
+
+    def send_enter_key(
+        self,
+        *,
+        screen_id: str,
+        caret_scope: Box,
+        image_output: Path | None = None,
+    ) -> KeyActionResult: ...
 
     def find_text(
         self,

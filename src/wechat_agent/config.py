@@ -13,6 +13,19 @@ import yaml
 DEFAULT_IPHONE_AGENT_CLI = "/Users/seven/Documents/esp32-iphone-agent-hybrid-new/server/.venv/bin/iphone-agent"
 DEFAULT_IPHONE_AGENT_URL = "http://127.0.0.1:8890"
 DEFAULT_ALLOWED_TARGETS = ("文件传输助手",)
+VALID_SEND_METHODS = ("enter", "click")
+
+
+def validate_send_method(value: Any, field_name: str = "send_method", *, default: str = "enter") -> str:
+    """Strictly validate send_method ('enter' | 'click')."""
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be one of {VALID_SEND_METHODS}, got {type(value).__name__}: {value!r}")
+    normalized = value.strip().lower()
+    if normalized not in VALID_SEND_METHODS:
+        raise ValueError(f"{field_name} must be one of {VALID_SEND_METHODS}, got {value!r}")
+    return normalized
 
 
 def require_bool(value: Any, field_name: str, *, default: bool | None = None) -> bool:
@@ -66,8 +79,14 @@ class WeChatSendConfig:
     paste_flow_timeout_seconds: float = 180.0
     point_rehome_retries: int = 1
     pre_send_point_retries: int = 3
+    enter_send_409_retries: int = 2
+    send_method: str = "enter"
     require_mounted_skill: bool = True
     allow_group_count: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "send_method", validate_send_method(self.send_method))
+        object.__setattr__(self, "enter_send_409_retries", max(0, int(self.enter_send_409_retries)))
 
     def resolved_evidence_root(self) -> Path:
         if self.evidence_root.is_absolute():
@@ -93,6 +112,7 @@ def load_config(
     allowed_targets_override: list[str] | tuple[str, ...] | None = None,
     skill_name_override: str | None = None,
     ocr_backend_override: str | None = None,
+    send_method_override: str | None = None,
     cli_override: str | None = None,
     url_override: str | None = None,
 ) -> WeChatSendConfig:
@@ -129,6 +149,11 @@ def load_config(
     )
     point_rehome_retries = max(0, int(data.get("point_rehome_retries", 1)))
     pre_send_point_retries = max(1, int(data.get("pre_send_point_retries", 3)))
+    enter_send_409_retries = max(0, int(data.get("enter_send_409_retries", 2)))
+    send_method = validate_send_method(
+        send_method_override if send_method_override is not None else data.get("send_method"),
+        default="enter",
+    )
     require_mounted_skill = require_bool(
         data.get("require_mounted_skill"), "require_mounted_skill", default=True
     )
@@ -154,6 +179,8 @@ def load_config(
         paste_flow_timeout_seconds=paste_flow_timeout,
         point_rehome_retries=point_rehome_retries,
         pre_send_point_retries=pre_send_point_retries,
+        enter_send_409_retries=enter_send_409_retries,
+        send_method=send_method,
         require_mounted_skill=require_mounted_skill,
         allow_group_count=allow_group_count,
     )

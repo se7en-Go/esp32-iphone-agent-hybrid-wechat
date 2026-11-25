@@ -7,7 +7,7 @@ from pathlib import Path
 
 from tests.fakes import FakePhoneDriver, MockOcrEngine, make_collapsed_chat_image, make_home_screen_image
 from wechat_agent.guards.rate_limit import RateLimitConfig
-from wechat_agent.models import Box, ClickResult, Observation, OcrBox
+from wechat_agent.models import Box, ClickResult, KeyActionResult, Observation, OcrBox
 from wechat_agent.monitor.config import GroupPolicyConfig, MonitorConfig
 from wechat_agent.monitor.decision import (
     HybridDecisionGate,
@@ -52,10 +52,12 @@ def _monitor_cfg(
     allow_live_send: bool = False,
     group_name: str = "产品测试群",
     allow_dry_run_paste: bool = False,
+    send_method: str = "enter",
 ) -> MonitorConfig:
     return MonitorConfig(
         mode=mode,
         allow_live_send=allow_live_send,
+        send_method=send_method,
         target_groups=(
             GroupPolicyConfig(
                 name=group_name,
@@ -127,8 +129,11 @@ def test_baseline_observe_only_and_real_group_dry_run_red_line(tmp_path: Path) -
         assert r1.reply_text == "@新同学 白天9点到晚上8点都在"
         assert r1.decision is not None and r1.decision["jev"]["Choice"] == "REPLY"
 
-    # Real-group dry-run MUST perform ZERO device clicks/focus/paste!
-    assert not any(c[0] in {"point", "click_observed", "paste_flow", "skill_prepare_send"} for c in driver.calls)
+    # Real-group dry-run MUST perform ZERO device clicks/focus/paste/enter!
+    assert not any(
+        c[0] in {"point", "click_observed", "send_enter_key", "paste_flow", "skill_prepare_send"}
+        for c in driver.calls
+    )
 
     # Cross-restart check: reopening store & seeing same frame s3 must NOT re-trigger
     with MonitorStore(cfg.state_db_path, cfg.audit_log_path) as store2:
@@ -222,14 +227,20 @@ def test_human_takeover_silences_while_bot_own_reply_does_not(tmp_path: Path) ->
         Observation("m1", f_ask),        # tick 1 runner observe -> triggers live send
         Observation("s0", f_ask),        # live workflow initial observe
         Observation("s2", kb_pasted),    # live workflow post-paste observe
+        Observation("s3", kb_pasted),    # live workflow fresh pre-enter observe
         Observation("m2", f_bot_bubble), # tick 2 sees bot's OWN bubble -> must NOT trigger takeover!
         Observation("m3", f_human_bubble),  # tick 3 sees manual human bubble + new question -> MUST silence!
     ]
-    click_seq = [
-        ClickResult("c-kb", clicked=True, command_acknowledged=True, image_bytes=kb_empty),
-        ClickResult("c-sent", clicked=True, command_acknowledged=True, effect_verified=True, image_bytes=f_bot_bubble),
-    ]
-    driver.click_handler = lambda *args: click_seq.pop(0)
+    driver.click_handler = lambda *args: ClickResult(
+        "c-kb", clicked=True, command_acknowledged=True, image_bytes=kb_empty
+    )
+    driver.key_action_handler = lambda sid, scope: KeyActionResult(
+        screen_id="k-sent",
+        command_acknowledged=True,
+        action_may_have_executed=True,
+        effect_verified=False,
+        image_bytes=f_bot_bubble,
+    )
 
     now = {"t": 3000.0}
     cfg = _monitor_cfg(tmp_path, mode=MonitorMode.LIVE, allow_live_send=True)
@@ -291,8 +302,8 @@ def test_pause_on_lock_screen_left_group_and_halt_on_risk_phrase(tmp_path: Path)
         TickOutcome.HALTED_RISK_PHRASE,
     ]
     assert reports[-1].should_halt is True
-    # Zero blind clicks during pause/halt
-    assert not any(c[0] in {"point", "click_observed", "paste_flow"} for c in driver.calls)
+    # Zero blind clicks/enter during pause/halt
+    assert not any(c[0] in {"point", "click_observed", "send_enter_key", "paste_flow"} for c in driver.calls)
 
 
 def test_group_monitor_example_config_and_send_error_halt(tmp_path: Path) -> None:
@@ -763,19 +774,24 @@ def test_same_sender_burst_merge_and_pending_queue_drain_after_cooldown_and_ttl_
         Observation("o1", f_burst),  # tick 1 runner sees burst -> replies live to A
         Observation("w1", f_burst),  # workflow 1 initial
         Observation("w1p", p1),      # workflow 1 post-paste
+        Observation("w1e", p1),      # workflow 1 fresh pre-enter
         Observation("o2", f_burst),  # tick 2 during cooldown (10s later) -> SKIPPED_COOLDOWN keeping B,C pending
         Observation("o3", f_burst),  # tick 3 after cooldown (70s later) -> drains B live
         Observation("w2", f_burst),  # workflow 2 initial
         Observation("w2p", p2),      # workflow 2 post-paste
+        Observation("w2e", p2),      # workflow 2 fresh pre-enter
         Observation("o4", f_burst),  # tick 4 at +200s (> 180s TTL of C) -> C expired -> NO_NEW_MESSAGES
     ]
     click_seq = [
         ClickResult("c1k", clicked=True, command_acknowledged=True, image_bytes=kb_empty),
-        ClickResult("c1s", clicked=True, command_acknowledged=True, effect_verified=True, image_bytes=s1),
         ClickResult("c2k", clicked=True, command_acknowledged=True, image_bytes=kb_empty),
-        ClickResult("c2s", clicked=True, command_acknowledged=True, effect_verified=True, image_bytes=s2),
     ]
     driver.click_handler = lambda *args: click_seq.pop(0)
+    enter_seq = [
+        KeyActionResult("e1s", command_acknowledged=True, action_may_have_executed=True, image_bytes=s1),
+        KeyActionResult("e2s", command_acknowledged=True, action_may_have_executed=True, image_bytes=s2),
+    ]
+    driver.key_action_handler = lambda *args: enter_seq.pop(0)
 
     now = {"t": 2000.0}
     cfg = _monitor_cfg(tmp_path, mode=MonitorMode.LIVE, allow_live_send=True, group_name="示例测试群")
@@ -1079,5 +1095,21 @@ def test_aborted_existing_draft_reclaims_lock_on_retry_while_ambiguous_send_neve
                 now=now["t"] + 1.0,
                 allow_reclaim_statuses=(SendStatus.ABORTED_EXISTING_DRAFT.value,),
             ) is False
+
+
+def test_monitor_runner_forwards_send_method_to_sender_factory(tmp_path: Path) -> None:
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    gate, gen = _rules_gate_and_gen()
+
+    for expected_method in ("enter", "click"):
+        cfg = _monitor_cfg(tmp_path, mode=MonitorMode.LIVE, allow_live_send=True, send_method=expected_method)
+        with MonitorStore(
+            tmp_path / f"{expected_method}.db",
+            tmp_path / f"{expected_method}.jsonl",
+        ) as store:
+            runner = MonitorRunner(driver, ocr, cfg, store, gate, gen)
+            sender = runner._default_sender_factory(cfg.target_groups[0])
+            assert sender.config.send_method == expected_method
 
 

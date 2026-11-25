@@ -79,3 +79,5 @@ audit_log_path: ".local-data/state/monitor_audit.jsonl"
 evidence_root: ".local-data/runs"
 cli_timeout_seconds: 90.0
 paste_flow_timeout_seconds: 180.0
+# 发送方式：enter（默认，受保护键盘回车发送）| click（点击蓝色发送按钮）
+send_method: "enter"

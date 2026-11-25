@@ -157,3 +157,100 @@ def test_cli_driver_paste_flow_uses_dedicated_timeout_and_handles_timeout_gracef
     assert "Never blindly rerun paste-flow" in res_timeout.next_action
 
 
+def test_cli_driver_send_enter_key_payload_image_output_and_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    recorded_cmds: list[list[str]] = []
+    out_img = tmp_path / "evidence" / "send_enter.jpg"
+
+    def fake_run_ok(cmd, **kwargs):
+        recorded_cmds.append(list(cmd))
+        out_idx = cmd.index("--image-output") + 1
+        Path(cmd[out_idx]).write_bytes(b"fake-jpeg-bytes")
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(
+                {
+                    "screen_id": "scr-after-enter",
+                    "command_acknowledged": True,
+                    "action_may_have_executed": True,
+                    "effect_verified": False,
+                    "changed": True,
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run_ok)
+    driver = IphoneAgentCliDriver("/fake/iphone-agent", "http://127.0.0.1:8890")
+    scope = Box(0.132, 0.528, 0.764, 0.576)
+    res = driver.send_enter_key(screen_id="scr-fresh-1", caret_scope=scope, image_output=out_img)
+
+    cmd = recorded_cmds[0]
+    action_idx = cmd.index("action")
+    payload = json.loads(cmd[action_idx + 1])
+    assert payload == {
+        "action": "key",
+        "text": "enter",
+        "screen_id": "scr-fresh-1",
+        "caret_scope": [0.132, 0.528, 0.764, 0.576],
+    }
+    assert "enter_intent" not in payload
+    assert "--image-output" in cmd
+    assert res.screen_id == "scr-after-enter"
+    assert res.command_acknowledged is True
+    assert res.action_may_have_executed is True
+    assert res.effect_verified is False
+    assert res.changed is True
+    assert res.image_bytes == b"fake-jpeg-bytes"
+
+    # Parse action_may_have_executed=False and None strictly
+    def fake_run_false_and_missing(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(
+                {
+                    "screen_id": "scr-2",
+                    "command_acknowledged": False,
+                    "action_may_have_executed": False,
+                    "error": "busy",
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run_false_and_missing)
+    res_false = driver.send_enter_key(screen_id="scr-fresh-2", caret_scope=scope)
+    assert res_false.command_acknowledged is False
+    assert res_false.action_may_have_executed is False
+    assert res_false.error == "busy"
+
+    # Raise ConflictError on HTTP 409 preserving raw payload
+    def fake_run_409(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd,
+            2,
+            stdout="",
+            stderr=json.dumps(
+                {
+                    "status_code": 409,
+                    "error": "HTTP 409: screen changed since the original observation; observe again before acting",
+                    "action_may_have_executed": False,
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run_409)
+    with pytest.raises(ConflictError) as exc_info:
+        driver.send_enter_key(screen_id="scr-fresh-3", caret_scope=scope)
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.raw.get("action_may_have_executed") is False
+
+    with pytest.raises(ValueError, match="screen_id"):
+        driver.send_enter_key(screen_id="", caret_scope=scope)
+
+

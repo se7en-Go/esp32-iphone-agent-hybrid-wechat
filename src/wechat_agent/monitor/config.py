@@ -18,6 +18,7 @@ from wechat_agent.config import (
     clamp_timeout,
     repo_root,
     require_bool,
+    validate_send_method,
 )
 from wechat_agent.guards.rate_limit import DEFAULT_FORBIDDEN_PATTERNS, RateLimitConfig
 from wechat_agent.monitor.llm_client import LlmConfig
@@ -93,6 +94,7 @@ class MonitorConfig:
     short_discontinuity_window_seconds: float = 90.0
     cli_timeout_seconds: float = 90.0
     paste_flow_timeout_seconds: float = 180.0
+    send_method: str = "enter"
     require_mounted_skill: bool = True
     state_db_path: Path = Path(".local-data/state/wechat_monitor.db")
     audit_log_path: Path = Path(".local-data/state/monitor_audit.jsonl")
@@ -101,6 +103,7 @@ class MonitorConfig:
     llm: LlmConfig = LlmConfig()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "send_method", validate_send_method(self.send_method))
         if len(self.target_groups) > 1:
             active = self.target_groups[0].name
             ignored = [g.name for g in self.target_groups[1:]]
@@ -335,6 +338,7 @@ def load_monitor_config(
 
     yaml_allow_live = require_bool(data.get("allow_live_send"), "allow_live_send", default=False)
     allow_live_override = require_bool(allow_live_send_override, "allow_live_send_override", default=False)
+    send_method = validate_send_method(data.get("send_method"), default="enter")
 
     return MonitorConfig(
         iphone_agent_cli=cli_path,
@@ -373,6 +377,7 @@ def load_monitor_config(
         short_discontinuity_window_seconds=short_disc,
         cli_timeout_seconds=cli_timeout,
         paste_flow_timeout_seconds=paste_flow_timeout,
+        send_method=send_method,
         require_mounted_skill=require_bool(
             data.get("require_mounted_skill"), "require_mounted_skill", default=True
         ),

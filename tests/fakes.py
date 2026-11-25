@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw
 from wechat_agent.models import (
     Box,
     ClickResult,
+    KeyActionResult,
     MeasuredPointer,
     Observation,
     OcrBox,
@@ -192,6 +193,7 @@ class FakePhoneDriver:
         self.observe_for_click_queue: list[Observation | Exception] = []
         self.point_handler: Callable[[float, float, str, Box | None, bool], PointResult | Exception] | None = None
         self.click_handler: Callable[[float, float, str, Box, str], ClickResult | Exception] | None = None
+        self.key_action_handler: Callable[[str, Box], KeyActionResult | Exception] | None = None
         self.search_app_handler: Callable[[str, str], Observation] | None = None
         self.scroll_handler: Callable[[float, float, int, str], Observation] | None = None
         self.paste_flow_handler: Callable[..., PasteFlowResult] | None = None
@@ -334,6 +336,34 @@ class FakePhoneDriver:
                 raise res
             return res
         return ClickResult(screen_id=f"{screen_id}-clk", clicked=True, command_acknowledged=True, effect_verified=True)
+
+    def send_enter_key(
+        self,
+        *,
+        screen_id: str,
+        caret_scope: Box,
+        image_output: Path | None = None,
+    ) -> KeyActionResult:
+        self.calls.append(
+            (
+                "send_enter_key",
+                {
+                    "screen_id": screen_id,
+                    "caret_scope": caret_scope,
+                },
+            )
+        )
+        if self.key_action_handler:
+            res = self.key_action_handler(screen_id, caret_scope)
+            if isinstance(res, Exception):
+                raise res
+            return res
+        return KeyActionResult(
+            screen_id=f"{screen_id}-enter",
+            command_acknowledged=True,
+            action_may_have_executed=True,
+            effect_verified=False,
+        )
 
     def find_text(
         self,

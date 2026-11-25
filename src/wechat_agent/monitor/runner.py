@@ -172,6 +172,7 @@ class MonitorRunner:
             evidence_root=self.config.evidence_root,
             cli_timeout_seconds=self.config.cli_timeout_seconds,
             paste_flow_timeout_seconds=self.config.paste_flow_timeout_seconds,
+            send_method=self.config.send_method,
             require_mounted_skill=self.config.require_mounted_skill,
             allow_group_count=True,
         )
