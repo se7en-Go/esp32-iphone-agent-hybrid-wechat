@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import io
 import re
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from enum import Enum
 
 import numpy as np
@@ -522,6 +523,15 @@ def _canonical_text(text: str) -> str:
     return re.sub(r"\s+", "", normalize_text(text))
 
 
+_OCR_PUNCT_RE = re.compile(
+    r"[，,。？?！!、；;：:·•'\"‘’“”「」『』()（）\[\]【】—–\-_~…]+|(?<!\d)\.(?!\d)"
+)
+
+
+def _strip_ocr_punctuation(text: str) -> str:
+    return _OCR_PUNCT_RE.sub("", _canonical_text(text))
+
+
 def _group_visual_rows(items: list[OcrBox]) -> list[list[OcrBox]]:
     """Group OCR boxes inside an input region into visual rows ordered top-to-bottom, left-to-right."""
     if not items:
@@ -599,13 +609,33 @@ def verify_pasted_text(
     if len(canon_obs) >= int(1.85 * len(canon_exp)) and len(canon_exp) >= 2:
         return False, observed_raw
 
-    if canon_obs != canon_exp:
+    stripped_obs = _strip_ocr_punctuation(observed_raw)
+    stripped_exp = _strip_ocr_punctuation(expected_text)
+    if len(stripped_exp) >= 2 and (
+        stripped_obs.count(stripped_exp) > 1 or len(stripped_obs) >= int(1.85 * len(stripped_exp))
+    ):
         return False, observed_raw
 
-    exp_lines = [_canonical_text(line) for line in expected_text.splitlines() if _canonical_text(line)]
-    obs_rows = [_canonical_text(rt) for rt in row_texts if _canonical_text(rt)]
-    if len(exp_lines) > 1 and not _matches_logical_lines(exp_lines, obs_rows):
+    if canon_obs == canon_exp:
+        exp_lines = [_canonical_text(line) for line in expected_text.splitlines() if _canonical_text(line)]
+        obs_rows = [_canonical_text(rt) for rt in row_texts if _canonical_text(rt)]
+        if len(exp_lines) > 1 and not _matches_logical_lines(exp_lines, obs_rows):
+            return False, observed_raw
+        return True, observed_raw
+
+    if not stripped_exp or stripped_obs != stripped_exp:
         return False, observed_raw
+    if len(canon_obs) > len(canon_exp) + max(2, len(canon_exp) // 10):
+        return False, observed_raw
+
+    exp_raw_lines = [line for line in expected_text.splitlines() if _canonical_text(line)]
+    if len(exp_raw_lines) > 1:
+        exp_stripped_lines = [_strip_ocr_punctuation(line) for line in exp_raw_lines]
+        if any(not line for line in exp_stripped_lines):
+            return False, observed_raw
+        obs_stripped_rows = [_strip_ocr_punctuation(rt) for rt in row_texts if _strip_ocr_punctuation(rt)]
+        if not _matches_logical_lines(exp_stripped_lines, obs_stripped_rows):
+            return False, observed_raw
 
     return True, observed_raw
 
@@ -837,26 +867,39 @@ def extract_outgoing_bubbles(
     return ["\n".join(part.text.strip() for part in grp if part.text.strip()) for grp in grouped]
 
 
+def _outgoing_bubble_matches(observed_text: str, expected_text: str) -> bool:
+    canon_obs = _canonical_text(observed_text)
+    canon_exp = _canonical_text(expected_text)
+    if not canon_obs or not canon_exp:
+        return False
+    if canon_obs == canon_exp:
+        return True
+
+    stripped_obs = _strip_ocr_punctuation(observed_text)
+    stripped_exp = _strip_ocr_punctuation(expected_text)
+    if stripped_exp and stripped_obs == stripped_exp:
+        return True
+
+    if len(canon_exp) >= 10 and len(canon_obs) >= 10:
+        ratio = min(len(canon_exp), len(canon_obs)) / max(len(canon_exp), len(canon_obs))
+        if ratio >= 0.85 and (canon_exp in canon_obs or canon_obs in canon_exp):
+            return True
+
+    if len(stripped_exp) >= 12 and len(stripped_obs) >= 12:
+        if SequenceMatcher(None, stripped_exp, stripped_obs).ratio() >= 0.92:
+            return True
+
+    return False
+
+
 def has_new_outgoing_bubble(
     baseline_bubbles: list[str],
     current_bubbles: list[str],
     expected_text: str,
 ) -> bool:
     """Confirm that a genuinely NEW outgoing bubble matching `expected_text` appeared after Send."""
-    canon_expected = _canonical_text(expected_text)
-    if not canon_expected or not current_bubbles:
+    if not _canonical_text(expected_text) or not current_bubbles:
         return False
-
-    base_counts = Counter(_canonical_text(b) for b in baseline_bubbles)
-    curr_counts = Counter(_canonical_text(b) for b in current_bubbles)
-
-    # Check if an exact (or long-text >=85% OCR-edge-truncated) bubble increased in count over baseline.
-    for canon_msg, count in curr_counts.items():
-        if count > base_counts.get(canon_msg, 0):
-            if canon_msg == canon_expected:
-                return True
-            if len(canon_expected) >= 10 and len(canon_msg) >= 10:
-                ratio = min(len(canon_expected), len(canon_msg)) / max(len(canon_expected), len(canon_msg))
-                if ratio >= 0.85 and (canon_expected in canon_msg or canon_msg in canon_expected):
-                    return True
-    return False
+    base_matches = sum(1 for b in baseline_bubbles if _outgoing_bubble_matches(b, expected_text))
+    curr_matches = sum(1 for b in current_bubbles if _outgoing_bubble_matches(b, expected_text))
+    return curr_matches > base_matches

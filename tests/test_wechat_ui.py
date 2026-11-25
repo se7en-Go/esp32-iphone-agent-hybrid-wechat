@@ -485,3 +485,97 @@ def test_detect_keyboard_and_verify_pasted_text_5line_dense_chinese_draft() -> N
     assert observed == "\n".join(lines)
 
 
+def test_has_new_outgoing_bubble_ocr_punctuation_tolerance_and_baseline_dedup() -> None:
+    expected = (
+        "物流单号一般在商品下单页的订单详情里能查看，找不到就找群主帮确认；"
+        "团购链接就在群里官方团购链接或小程序里，点进去按页面提示操作就行。"
+    )
+    ocr_dropped_comma = (
+        "物流单号一般在商品下单页的\n"
+        "订单详情里能查看，找不到就\n"
+        "找群主帮确认；团购链接就在\n"
+        "群里官方团购链接或小程序里\n"
+        "点进去按页面提示操作就行。"
+    )
+    ocr_mild_jitter = (
+        "物流单号一般在商品下单页的\n"
+        "订单详情里能查看，找不到就\n"
+        "找群主帮确认；团购链接就在\n"
+        "群里官方团购链接或小程序里\n"
+        "点进去按页面提示操作就衍。"
+    )
+
+    # 1. Mid-bubble dropped comma & long-text mild OCR jitter pass when genuinely new
+    assert has_new_outgoing_bubble([], [ocr_dropped_comma], expected) is True
+    assert has_new_outgoing_bubble([], [ocr_mild_jitter], expected) is True
+
+    # 2. Same-matcher baseline dedup: existing matching bubble with OCR punctuation/jitter MUST NOT re-trigger
+    assert has_new_outgoing_bubble([expected], [ocr_dropped_comma], expected) is False
+    assert has_new_outgoing_bubble([expected], [ocr_mild_jitter], expected) is False
+
+    # 3. Genuine second identical send (2 matching current > 1 matching baseline) MUST pass
+    assert has_new_outgoing_bubble([expected], [expected, ocr_dropped_comma], expected) is True
+
+    # 4. Short wrong-char, 10-char wrong-char, decimal-dot drop, and major diff (<0.92) MUST reject
+    assert has_new_outgoing_bubble([], ["请后天发货"], "请明天发货") is False
+    assert has_new_outgoing_bubble([], ["请问团购不包邮吗谢啦"], "请问团购包邮吗谢谢啦") is False
+    assert has_new_outgoing_bubble([], ["价格199元"], "价格19.9元") is False
+    assert (
+        has_new_outgoing_bubble(
+            [],
+            ["请联系售后客服提交订单信息并等待人工处理回复吧"],
+            "这期商品和价格看群里的官方团购链接或小程序确认吧",
+        )
+        is False
+    )
+
+
+def test_verify_pasted_text_punctuation_tolerance_keeps_content_strict() -> None:
+    pill = Box(0.132, 0.432, 0.764, 0.576)
+
+    # 1. Dropped comma inside multi-line soft-wrapped draft -> MUST pass
+    expected_multi = (
+        "物流单号一般在商品下单页的订单详情里能查看，找不到就找群主帮确认；"
+        "团购链接就在群里官方团购链接或小程序里，点进去按页面提示操作就行。"
+    )
+    rows_dropped_comma = [
+        OcrBox("物流单号一般在商品下单页的", Box(0.16, 0.442, 0.71, 0.462)),
+        OcrBox("订单详情里能查看，找不到就", Box(0.16, 0.468, 0.71, 0.488)),
+        OcrBox("找群主帮确认；团购链接就在", Box(0.16, 0.493, 0.71, 0.513)),
+        OcrBox("群里官方团购链接或小程序里", Box(0.16, 0.518, 0.71, 0.538)),
+        OcrBox("点进去按页面提示操作就行。", Box(0.16, 0.542, 0.65, 0.564)),
+    ]
+    assert verify_pasted_text(rows_dropped_comma, pill, expected_multi)[0] is True
+
+    # 2. Full/half-width punctuation variant (。 vs ., “” vs "") -> MUST pass
+    rows_punct_variant = [
+        OcrBox('查看"团购说明".', Box(0.16, 0.48, 0.55, 0.505)),
+    ]
+    assert verify_pasted_text(rows_punct_variant, pill, "查看“团购说明”。")[0] is True
+
+    # 3. Hard-newline structure remains strictly enforced under punctuation tolerance
+    preserved_newline_rows = [
+        OcrBox("第一行内容，已确认", Box(0.16, 0.47, 0.55, 0.495)),
+        OcrBox("第二行补充无误", Box(0.16, 0.505, 0.55, 0.530)),
+    ]
+    assert verify_pasted_text(preserved_newline_rows, pill, "第一行内容，已确认\n第二行补充无误。")[0] is True
+
+    merged_newline_row = [
+        OcrBox("第一行内容已确认第二行补充无误", Box(0.16, 0.48, 0.65, 0.505)),
+    ]
+    assert verify_pasted_text(merged_newline_row, pill, "第一行内容，已确认\n第二行补充无误。")[0] is False
+
+    # 4. Content typo, decimal dot drop, and duplicated paste with dropped comma MUST fail
+    assert verify_pasted_text([OcrBox("价格看连结。", Box(0.16, 0.48, 0.45, 0.505))], pill, "价格看链接。")[0] is False
+    assert verify_pasted_text([OcrBox("价格199元", Box(0.16, 0.48, 0.45, 0.505))], pill, "价格19.9元")[0] is False
+    assert (
+        verify_pasted_text(
+            [OcrBox("你好测试消息你好测试消息", Box(0.16, 0.48, 0.70, 0.505))],
+            pill,
+            "你好，测试消息",
+        )[0]
+        is False
+    )
+
+
+
