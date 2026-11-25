@@ -401,3 +401,72 @@ def test_claim_bot_reply_match_tightened_prevents_short_substring_takeover_bypas
         # Single-char OCR truncation (14/15 = 93.3% >= 85%) DOES match
         assert store.claim_bot_reply_match(g, "请按群内官方团购链接下单即可", since_ts=150.0) is True
 
+
+def test_claim_bot_reply_match_ocr_punctuation_drop_and_strict_rejections(tmp_path: Path) -> None:
+    db_path = tmp_path / "state" / "claim_punct.db"
+    g = "好物分享·品牌特卖3群(198)"
+    reply = (
+        "满减和包邮门槛每期活动不太一样，具体看群里官方团购链接或小程序里的活动说明；"
+        "单件运费也以下单页显示的为准，拿不准就找群主确认这期规则。"
+    )
+    ocr_dropped_comma = (
+        "满减和包邮门槛每期活动不太\n"
+        "一样，具体看群里官方团购链\n"
+        "接或小程序里的活动说明；单\n"
+        "件运费也以下单页显示的为准\n"
+        "拿不准就找群主确认这期规则。"
+    )
+    with MonitorStore(db_path) as store:
+        # 1. Dropped internal comma in multiline OCR bubble matches once and consumes record
+        store.record_reply_decision(
+            fingerprint="bot-punct-1",
+            group_title=g,
+            mode="live",
+            status="sent_confirmed",
+            reply_text=reply,
+            now=300.0,
+        )
+        assert store.claim_bot_reply_match(g, ocr_dropped_comma, since_ts=250.0) is True
+        assert store.claim_bot_reply_match(g, ocr_dropped_comma, since_ts=250.0) is False
+
+        # 2. Short reply typo MUST be rejected
+        store.record_reply_decision(
+            fingerprint="bot-short-typo",
+            group_title=g,
+            mode="live",
+            status="sent_confirmed",
+            reply_text="请明天发货",
+            now=310.0,
+        )
+        assert store.claim_bot_reply_match(g, "请后天发货", since_ts=250.0) is False
+
+        # 3. Decimal-dot drop MUST be rejected
+        store.record_reply_decision(
+            fingerprint="bot-decimal",
+            group_title=g,
+            mode="live",
+            status="sent_confirmed",
+            reply_text="价格19.9元",
+            now=320.0,
+        )
+        assert store.claim_bot_reply_match(g, "价格199元", since_ts=250.0) is False
+
+        # 4. Long unrelated human message MUST be rejected
+        store.record_reply_decision(
+            fingerprint="bot-long-unrelated",
+            group_title=g,
+            mode="live",
+            status="sent_confirmed",
+            reply_text="这期商品和价格看群里的官方团购链接或小程序确认吧",
+            now=330.0,
+        )
+        assert (
+            store.claim_bot_reply_match(
+                g,
+                "请联系售后客服提交订单信息并等待人工处理回复吧",
+                since_ts=250.0,
+            )
+            is False
+        )
+
+
