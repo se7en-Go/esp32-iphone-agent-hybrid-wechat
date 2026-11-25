@@ -27,7 +27,7 @@ from wechat_agent.vision.wechat_ui import (
     has_new_outgoing_bubble,
     locate_blue_send_button,
     locate_collapsed_input_box,
-    verify_pasted_text,
+    verify_pasted_text_with_fallback,
 )
 
 from .click_chain import ClickChain, PointerConflictError, PointerNotConfirmedError, SendPreconditionError
@@ -328,7 +328,9 @@ class SendMessageWorkflow:
         focused_post = detect_keyboard_and_focused_input(post_obs.image_bytes, post_ocr)
         if focused_post is not None:
             active_input_box = focused_post.input_box
-            text_ok, observed_pasted = verify_pasted_text(
+            text_ok, observed_pasted = verify_pasted_text_with_fallback(
+                self.ocr,
+                post_obs.image_bytes,
                 post_ocr,
                 active_input_box,
                 clean_text,
@@ -336,7 +338,9 @@ class SendMessageWorkflow:
             )
         else:
             active_input_box = focused.input_box
-            text_ok, observed_pasted = verify_pasted_text(
+            text_ok, observed_pasted = verify_pasted_text_with_fallback(
+                self.ocr,
+                post_obs.image_bytes,
                 post_ocr,
                 active_input_box,
                 clean_text,
@@ -444,7 +448,9 @@ class SendMessageWorkflow:
                     status=SendStatus.ABORTED_PASTE_VERIFY,
                 )
             fresh_input = focused_now.input_box if focused_now is not None else active_input_box
-            ok_text, obs_text = verify_pasted_text(
+            ok_text, obs_text = verify_pasted_text_with_fallback(
+                self.ocr,
+                frame_obs.image_bytes,
                 frame_ocr,
                 fresh_input,
                 clean_text,
