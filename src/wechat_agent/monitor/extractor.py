@@ -9,6 +9,7 @@ import time
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 import numpy as np
 from PIL import Image
@@ -67,6 +68,30 @@ def _canonical_for_hash(text: str) -> str:
     return re.sub(r"\s+", " ", normalize_text(text))
 
 
+_ALIGN_PUNCT_RE = re.compile(r"[，,。.？?！!、；;：:·•'\"‘’“”「」『』()（）\[\]【】—–\-_~…]+")
+
+
+def _normalize_align_punctuation(text: str) -> str:
+    return re.sub(r"\s+", " ", _ALIGN_PUNCT_RE.sub(" ", normalize_text(text))).strip()
+
+
+def _viewport_text_matches(text_a: str, text_b: str) -> bool:
+    if text_a == text_b:
+        return True
+    pa = _normalize_align_punctuation(text_a)
+    pb = _normalize_align_punctuation(text_b)
+    if pa and pa == pb:
+        return True
+    ca = re.sub(r"\s+", "", pa)
+    cb = re.sub(r"\s+", "", pb)
+    if len(ca) >= 12 and len(cb) >= 12:
+        if ca == cb:
+            return True
+        if SequenceMatcher(None, ca, cb).ratio() >= 0.92:
+            return True
+    return False
+
+
 def compute_message_fingerprint(
     group_title: str,
     role: MessageRole,
@@ -114,13 +139,25 @@ def _coerce_viewport_items(items: Sequence[ViewportItem | LegacyViewportItem]) -
     return out
 
 
+def _viewport_item_base_matches(a: ViewportItem, b: ViewportItem) -> bool:
+    return a[0] == b[0] and a[1] == b[1] and _viewport_text_matches(a[2], b[2])
+
+
+def _viewport_item_matches(a: ViewportItem, b: ViewportItem, *, occ_shift: int = 0) -> bool:
+    return _viewport_item_base_matches(a, b) and max(1, a[3] - occ_shift) == b[3]
+
+
 def _adjust_window_occurrences(
     prefix_scrolled: Sequence[ViewportItem],
     window: Sequence[ViewportItem],
 ) -> list[ViewportItem]:
-    """Shift window occurrences downward by the exact count of scrolled-off identical items."""
-    scrolled_counts = Counter((r, s, t) for r, s, t, _ in prefix_scrolled)
-    return [(r, s, t, max(1, occ - scrolled_counts[(r, s, t)])) for r, s, t, occ in window]
+    """Shift window occurrences downward by the exact count of scrolled-off matching items."""
+    out: list[ViewportItem] = []
+    for r, s, t, occ in window:
+        item: ViewportItem = (r, s, t, occ)
+        scrolled = sum(1 for p in prefix_scrolled if _viewport_item_base_matches(p, item))
+        out.append((r, s, t, max(1, occ - scrolled)))
+    return out
 
 
 def _viewport_slice_matches(
@@ -131,11 +168,18 @@ def _viewport_slice_matches(
     prev_slice = prev[prev_start : prev_start + len(curr_slice)]
     if len(prev_slice) != len(curr_slice):
         return False
-    if list(prev_slice) == list(curr_slice):
+    if all(_viewport_item_matches(p, c) for p, c in zip(prev_slice, curr_slice, strict=True)):
         return True
     if prev_start > 0:
-        adjusted = _adjust_window_occurrences(prev[:prev_start], prev_slice)
-        return adjusted == list(curr_slice)
+        prefix = prev[:prev_start]
+        return all(
+            _viewport_item_matches(
+                p,
+                c,
+                occ_shift=sum(1 for pre in prefix if _viewport_item_base_matches(pre, p)),
+            )
+            for p, c in zip(prev_slice, curr_slice, strict=True)
+        )
     return False
 
 
@@ -154,6 +198,52 @@ def compute_event_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
+def _match_middle_corrupted_anchor(
+    prev: Sequence[ViewportItem],
+    curr: Sequence[ViewportItem],
+) -> ViewportAlignment | None:
+    """Recover alignment when a middle bubble suffers heavy OCR corruption/occlusion.
+
+    Requires `prev[-1]` to match `curr[j]` (with `j >= 1`) AND `curr[:j]` to contain a
+    monotone in-order subsequence of at least 2 items matching `prev[:-1]`.
+    """
+    if len(prev) < 3 or len(curr) < 3:
+        return None
+    for j in range(len(curr) - 1, 0, -1):
+        if not _viewport_item_base_matches(prev[-1], curr[j]):
+            continue
+        prev_prefix = prev[:-1]
+        curr_prefix = curr[:j]
+        matched = 0
+        pi = 0
+        for c_item in curr_prefix:
+            for k in range(pi, len(prev_prefix)):
+                if _viewport_item_base_matches(prev_prefix[k], c_item):
+                    matched += 1
+                    pi = k + 1
+                    break
+        if matched >= 2:
+            return ViewportAlignment("aligned", matched + 1, j + 1)
+    return None
+
+
+def _is_ambiguous_k1_duplicate(
+    prev: Sequence[ViewportItem],
+    curr: Sequence[ViewportItem],
+) -> bool:
+    """Reject `k=1` alignment when `prev[-1]` looks like a repeated message scrolled to top."""
+    if len(curr) < 2:
+        return False
+    anchor = prev[-1]
+    if anchor[3] >= 2 and any(_viewport_item_base_matches(anchor, c) for c in curr[1:]):
+        return True
+    prev_prefix = prev[:-1]
+    prior_matches = sum(
+        1 for c in curr[1:] if any(_viewport_item_base_matches(p, c) for p in prev_prefix)
+    )
+    return prior_matches >= 2
+
+
 def align_viewport_suffix(
     prev_items: Sequence[ViewportItem | LegacyViewportItem],
     curr_items: Sequence[ViewportItem | LegacyViewportItem],
@@ -166,8 +256,8 @@ def align_viewport_suffix(
     if not prev:
         return ViewportAlignment("empty_prev", 0, 0)
 
-    # 1. Primary longest suffix-prefix overlap: prev[-k:] == curr[:k]
-    for k in range(min(len(prev), len(curr)), 0, -1):
+    # 1a. Primary longest suffix-prefix overlap (k >= 2): prev[-k:] == curr[:k]
+    for k in range(min(len(prev), len(curr)), 1, -1):
         if _viewport_slice_matches(prev, len(prev) - k, curr[:k]):
             return ViewportAlignment("aligned", k, k)
 
@@ -178,6 +268,15 @@ def align_viewport_suffix(
                 if _viewport_slice_matches(prev, len(prev) - k, curr[j : j + k]):
                     return ViewportAlignment("aligned", k, j + k)
 
+    # 2b. Middle-item OCR corruption/occlusion recovery (preserve tail anchor without replaying history)
+    mid_aligned = _match_middle_corrupted_anchor(prev, curr)
+    if mid_aligned is not None:
+        return mid_aligned
+
+    # 1b. Single-item suffix-prefix overlap (k = 1) with anti-duplicate guard
+    if _viewport_slice_matches(prev, len(prev) - 1, curr[:1]) and not _is_ambiguous_k1_duplicate(prev, curr):
+        return ViewportAlignment("aligned", 1, 1)
+
     # 3. Scroll-up / keyboard-obscured subset detection (never lose viewport tail anchor)
     if len(curr) < len(prev):
         for i in range(len(prev) - len(curr) + 1):
@@ -186,7 +285,9 @@ def align_viewport_suffix(
 
     for m in range(min(len(prev), len(curr)), 1, -1):
         curr_tail = _adjust_window_occurrences(curr[:-m], curr[-m:])
-        if list(prev[:m]) == list(curr[-m:]) or list(prev[:m]) == curr_tail:
+        if all(_viewport_item_matches(p, c) for p, c in zip(prev[:m], curr[-m:], strict=True)) or all(
+            _viewport_item_matches(p, c) for p, c in zip(prev[:m], curr_tail, strict=True)
+        ):
             return ViewportAlignment("scroll_up", m, len(curr))
 
     return ViewportAlignment("discontinuity", 0, len(curr))
