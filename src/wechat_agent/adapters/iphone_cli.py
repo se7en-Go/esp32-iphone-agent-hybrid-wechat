@@ -535,5 +535,7 @@ class IphoneAgentCliDriver:
             permission_sheet_seen=bool(raw.get("permission_sheet_seen", False)),
             error=str(raw.get("error") or raw.get("stopped") or ("" if ok else proc.stderr.strip())),
             image_path=str(image_output) if image_output and image_output.is_file() else None,
+            confirmation_evidence=str(raw.get("confirmation_evidence") or ""),
+            client_text_match=str(raw.get("client_text_match") or ""),
             raw=raw,
         )

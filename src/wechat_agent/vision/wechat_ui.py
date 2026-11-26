@@ -527,10 +527,224 @@ def _canonical_text(text: str) -> str:
 _OCR_PUNCT_RE = re.compile(
     r"[，,。？?！!、；;：:·•'\"‘’“”「」『』()（）\[\]【】—–\-_~…]+|(?<!\d)\.(?!\d)"
 )
+_TERMINAL_CJK_PUNCT = frozenset("。！？…")
+_MIN_CORNER_FADE_LEN = 15
+_HIGH_RISK_CORNER_FADE_TEXT_RE = re.compile(
+    r"[0-9¥￥$%]|https?://|www\.|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+",
+    re.IGNORECASE,
+)
+_PROTECTED_CORNER_FADE_CJK = frozenset("不没无非勿别否未禁停退转付款钱元折")
 
 
 def _strip_ocr_punctuation(text: str) -> str:
     return _OCR_PUNCT_RE.sub("", _canonical_text(text))
+
+
+def _rgb_to_gray(rgb: np.ndarray) -> np.ndarray:
+    """Convert an RGB uint8 array to ITU-R 601-2 uint8 luminance matching Pillow 'L'."""
+    r = rgb[:, :, 0].astype(np.uint32)
+    g = rgb[:, :, 1].astype(np.uint32)
+    b = rgb[:, :, 2].astype(np.uint32)
+    return ((r * 19595 + g * 38470 + b * 7471 + 32768) >> 16).astype(np.uint8)
+
+
+def _has_stationary_corner_icon(before_rgb: np.ndarray, input_box: Box) -> bool:
+    """Return True when the pre-paste empty input box has high-contrast corner chrome (e.g. mic)."""
+    if input_box.width > 0.72:
+        return False
+    h, w, _ = before_rgb.shape
+    x0 = max(0, min(w, round((input_box.right - 0.11) * w)))
+    y0 = max(0, min(h, round((input_box.bottom - 0.045) * h)))
+    x1 = max(0, min(w, round((input_box.right - 0.01) * w)))
+    y1 = max(0, min(h, round((input_box.bottom - 0.005) * h)))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    gray = _rgb_to_gray(before_rgb[y0:y1, x0:x1])
+    if gray.size == 0:
+        return False
+    return int(gray.min()) <= 160 and int(gray.max()) - int(gray.min()) >= 60
+
+
+def _filter_stationary_corner_icons(
+    items: list[OcrBox],
+    before_rgb: np.ndarray,
+    after_rgb: np.ndarray,
+    input_box: Box,
+    expected_text: str,
+) -> list[OcrBox]:
+    """Drop a single pixel-proven stationary bottom-right corner chrome OCR artifact (e.g. mic icon)."""
+    if before_rgb.shape != after_rgb.shape or input_box.width > 0.72:
+        return items
+    h, w, _ = before_rgb.shape
+    exp_canon = _canonical_text(expected_text)
+    drop_indices: set[int] = set()
+    for idx, item in enumerate(items):
+        if not (
+            item.box.left >= input_box.right - 0.12
+            and item.box.right <= input_box.right + 0.015
+            and item.box.top >= input_box.bottom - 0.06
+            and item.box.bottom <= input_box.bottom + 0.015
+            and 0.0 < item.box.width <= 0.07
+            and 0.0 < item.box.height <= 0.055
+        ):
+            continue
+        canon = _canonical_text(item.text)
+        if not (1 <= len(canon) <= 2):
+            continue
+        if all(ch in _TERMINAL_CJK_PUNCT for ch in canon):
+            continue
+        if exp_canon and exp_canon.endswith(canon):
+            continue
+        if any(item.box.intersects(other.box) for other in items if other is not item):
+            continue
+        x0 = max(0, min(w, round(item.box.left * w)))
+        y0 = max(0, min(h, round(item.box.top * h)))
+        x1 = max(0, min(w, round(item.box.right * w)))
+        y1 = max(0, min(h, round(item.box.bottom * h)))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        before_patch = before_rgb[y0:y1, x0:x1]
+        after_patch = after_rgb[y0:y1, x0:x1]
+        if before_patch.size == 0 or after_patch.size == 0:
+            continue
+        before_gray = _rgb_to_gray(before_patch)
+        if int(before_gray.max()) - int(before_gray.min()) < 40 or int(before_gray.min()) > 165:
+            continue
+        diff = np.abs(after_patch.astype(np.int16) - before_patch.astype(np.int16))
+        if float(diff.mean()) <= 3.0 and int(diff.max()) <= 20:
+            drop_indices.add(idx)
+    if len(drop_indices) != 1:
+        return items
+    return [item for idx, item in enumerate(items) if idx not in drop_indices]
+
+
+def _detect_corner_faded_rows(
+    visual_rows: list[list[OcrBox]],
+    before_rgb: np.ndarray,
+    after_rgb: np.ndarray,
+    input_box: Box,
+) -> dict[int, str]:
+    """Identify lower-right rows whose trailing glyph shows physical white-fade bleaching above the corner icon."""
+    if (
+        len(visual_rows) < 2
+        or before_rgb.shape != after_rgb.shape
+        or not _has_stationary_corner_icon(before_rgb, input_box)
+    ):
+        return {}
+    before_gray = _rgb_to_gray(before_rgb)
+    after_gray = _rgb_to_gray(after_rgb)
+    h, w = after_gray.shape
+    faded: dict[int, str] = {}
+    for r_idx in (len(visual_rows) - 2, len(visual_rows) - 1):
+        row = visual_rows[r_idx]
+        row_canon = _canonical_text(" ".join(b.text.strip() for b in row if b.text.strip()))
+        if len(row_canon) < 4:
+            continue
+        rx0 = min(b.box.left for b in row)
+        ry0 = min(b.box.top for b in row)
+        rx1 = max(b.box.right for b in row)
+        ry1 = max(b.box.bottom for b in row)
+        if ry1 < input_box.bottom - 0.065:
+            continue
+        x0 = max(0, min(w, round(rx0 * w)))
+        y0 = max(0, min(h, round(ry0 * h)))
+        x1 = max(0, min(w, round(rx1 * w)))
+        y1 = max(0, min(h, round(ry1 * h)))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        cw = max(12, round((x1 - x0) / len(row_canon)))
+        mid_y = (y0 + y1) // 2
+        if mid_y <= y0 or mid_y >= y1:
+            continue
+        if rx1 >= input_box.right - 0.08 and x1 - cw > x0:
+            left_min = int(after_gray[y0:y1, x0 : x1 - cw].min())
+            r_bot_min = int(after_gray[mid_y:y1, max(x0, x1 - cw) : x1].min())
+            if left_min <= 35 and r_bot_min >= 95:
+                faded[r_idx] = "sub"
+                continue
+        if input_box.right - 0.145 <= rx1 < input_box.right - 0.065:
+            row_min = int(after_gray[y0:y1, x0:x1].min())
+            cell_x1 = min(w, round(input_box.right * w), x1 + cw + 6)
+            if row_min <= 35 and cell_x1 >= x1 + 8:
+                before_min = int(before_gray[y0:y1, x1:cell_x1].min())
+                after_min = int(after_gray[y0:y1, x1:cell_x1].min())
+                after_bot_min = int(after_gray[mid_y:y1, x1:cell_x1].min())
+                if (
+                    before_min >= 225
+                    and after_min <= 215
+                    and before_min - after_min >= 40
+                    and after_bot_min >= 95
+                ):
+                    faded[r_idx] = "omit"
+    return faded
+
+
+def _is_safe_fade_cjk(ch: str) -> bool:
+    return len(ch) == 1 and "\u4e00" <= ch <= "\u9fff" and ch not in _PROTECTED_CORNER_FADE_CJK
+
+
+def _matches_corner_fade_rows(
+    exp_lines: list[str],
+    obs_rows: list[str],
+    expected_text: str,
+    observed_raw: str,
+    faded_rows: dict[int, str],
+) -> bool:
+    """Allow at most 1 physically faded lower-right safe-CJK substitution/omission while keeping structure strict."""
+    if not faded_rows or not exp_lines or not obs_rows:
+        return False
+    total_exp = sum(len(line) for line in exp_lines)
+    total_obs = sum(len(row) for row in obs_rows)
+    if total_exp < _MIN_CORNER_FADE_LEN or total_obs not in {total_exp, total_exp - 1}:
+        return False
+    if _HIGH_RISK_CORNER_FADE_TEXT_RE.search(expected_text) or _HIGH_RISK_CORNER_FADE_TEXT_RE.search(observed_raw):
+        return False
+
+    idx = 0
+    fade_used = False
+    for line in exp_lines:
+        pos = 0
+        while pos < len(line):
+            if idx >= len(obs_rows):
+                return False
+            row = obs_rows[idx]
+            kind = faded_rows.get(idx)
+            if (
+                total_obs == total_exp - 1
+                and not fade_used
+                and kind == "omit"
+                and len(row) >= 4
+                and pos + len(row) < len(line)
+                and line[pos : pos + len(row)] == row
+            ):
+                omitted = line[pos + len(row)]
+                if _is_safe_fade_cjk(omitted):
+                    fade_used = True
+                    pos += len(row) + 1
+                    idx += 1
+                    continue
+            chunk = line[pos : pos + len(row)]
+            if len(chunk) != len(row):
+                return False
+            if row == chunk:
+                pos += len(row)
+                idx += 1
+                continue
+            if (
+                total_obs == total_exp
+                and not fade_used
+                and kind == "sub"
+                and len(row) >= 4
+                and row[:-1] == chunk[:-1]
+                and _is_safe_fade_cjk(chunk[-1])
+                and _is_safe_fade_cjk(row[-1])
+            ):
+                fade_used = True
+                pos += len(row)
+                idx += 1
+                continue
+            return False
+    return idx == len(obs_rows) and fade_used
 
 
 def _group_visual_rows(items: list[OcrBox]) -> list[list[OcrBox]]:
@@ -577,6 +791,9 @@ def verify_pasted_text(
     expected_text: str,
     *,
     allow_upward_growth: bool = False,
+    image_bytes: bytes | None = None,
+    before_image_bytes: bytes | None = None,
+    trusted_paste_evidence: bool = False,
 ) -> tuple[bool, str]:
     """Verify pasted text inside `input_box` matches `expected_text` once, preserving hard newlines."""
     # When callers already pass the freshly detected post-paste white input box, keep a tight
@@ -595,6 +812,17 @@ def verify_pasted_text(
         if paste_region.contains(*item.box.center)
         and normalize_text(item.text) not in KEYBOARD_CUE_TOKENS
     ]
+    before_rgb: np.ndarray | None = None
+    after_rgb: np.ndarray | None = None
+    if trusted_paste_evidence and not allow_upward_growth and image_bytes and before_image_bytes:
+        before_rgb = _decode_rgb(before_image_bytes)
+        after_rgb = _decode_rgb(image_bytes)
+        if before_rgb is not None and after_rgb is not None:
+            items = _filter_stationary_corner_icons(items, before_rgb, after_rgb, input_box, expected_text)
+        else:
+            before_rgb = None
+            after_rgb = None
+
     visual_rows = _group_visual_rows(items)
     row_texts = [" ".join(b.text.strip() for b in row if b.text.strip()) for row in visual_rows]
     observed_raw = "\n".join(rt for rt in row_texts if rt)
@@ -617,28 +845,35 @@ def verify_pasted_text(
     ):
         return False, observed_raw
 
+    exp_lines = [_canonical_text(line) for line in expected_text.splitlines() if _canonical_text(line)]
+    obs_rows = [_canonical_text(rt) for rt in row_texts if _canonical_text(rt)]
+
     if canon_obs == canon_exp:
-        exp_lines = [_canonical_text(line) for line in expected_text.splitlines() if _canonical_text(line)]
-        obs_rows = [_canonical_text(rt) for rt in row_texts if _canonical_text(rt)]
         if len(exp_lines) > 1 and not _matches_logical_lines(exp_lines, obs_rows):
             return False, observed_raw
         return True, observed_raw
 
-    if not stripped_exp or stripped_obs != stripped_exp:
-        return False, observed_raw
-    if len(canon_obs) > len(canon_exp) + max(2, len(canon_exp) // 10):
-        return False, observed_raw
+    if (
+        stripped_exp
+        and stripped_obs == stripped_exp
+        and len(canon_obs) <= len(canon_exp) + max(2, len(canon_exp) // 10)
+    ):
+        exp_raw_lines = [line for line in expected_text.splitlines() if _canonical_text(line)]
+        if len(exp_raw_lines) > 1:
+            exp_stripped_lines = [_strip_ocr_punctuation(line) for line in exp_raw_lines]
+            if any(not line for line in exp_stripped_lines):
+                return False, observed_raw
+            obs_stripped_rows = [_strip_ocr_punctuation(rt) for rt in row_texts if _strip_ocr_punctuation(rt)]
+            if not _matches_logical_lines(exp_stripped_lines, obs_stripped_rows):
+                return False, observed_raw
+        return True, observed_raw
 
-    exp_raw_lines = [line for line in expected_text.splitlines() if _canonical_text(line)]
-    if len(exp_raw_lines) > 1:
-        exp_stripped_lines = [_strip_ocr_punctuation(line) for line in exp_raw_lines]
-        if any(not line for line in exp_stripped_lines):
-            return False, observed_raw
-        obs_stripped_rows = [_strip_ocr_punctuation(rt) for rt in row_texts if _strip_ocr_punctuation(rt)]
-        if not _matches_logical_lines(exp_stripped_lines, obs_stripped_rows):
-            return False, observed_raw
+    if before_rgb is not None and after_rgb is not None:
+        faded_rows = _detect_corner_faded_rows(visual_rows, before_rgb, after_rgb, input_box)
+        if _matches_corner_fade_rows(exp_lines, obs_rows, expected_text, observed_raw, faded_rows):
+            return True, observed_raw
 
-    return True, observed_raw
+    return False, observed_raw
 
 
 def prepare_input_box_ocr_crop(
@@ -700,6 +935,8 @@ def verify_pasted_text_with_fallback(
     expected_text: str,
     *,
     allow_upward_growth: bool = False,
+    before_image_bytes: bytes | None = None,
+    trusted_paste_evidence: bool = False,
 ) -> tuple[bool, str]:
     """Verify pasted text on `ocr_boxes`, retrying once on a caret-masked 2x input-box crop on mismatch."""
     ok, obs = verify_pasted_text(
@@ -707,6 +944,9 @@ def verify_pasted_text_with_fallback(
         input_box,
         expected_text,
         allow_upward_growth=allow_upward_growth,
+        image_bytes=image_bytes,
+        before_image_bytes=before_image_bytes,
+        trusted_paste_evidence=trusted_paste_evidence,
     )
     if ok or not image_bytes:
         return ok, obs
@@ -747,6 +987,9 @@ def verify_pasted_text_with_fallback(
         input_box,
         expected_text,
         allow_upward_growth=allow_upward_growth,
+        image_bytes=image_bytes,
+        before_image_bytes=before_image_bytes,
+        trusted_paste_evidence=trusted_paste_evidence,
     )
     if crop_ok:
         return True, crop_obs

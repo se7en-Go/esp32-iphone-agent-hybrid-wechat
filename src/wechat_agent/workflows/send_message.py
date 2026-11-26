@@ -265,6 +265,7 @@ class SendMessageWorkflow:
                 observed_draft=existing_draft,
             )
         steps.append("draft_clean")
+        pre_paste_image_bytes = obs.image_bytes
 
         # 7. Single paste-flow execution (NEVER retry on failure)
         expect_header_title = (
@@ -293,6 +294,15 @@ class SendMessageWorkflow:
                 next_action=paste_res.next_action,
                 paste_receipt=redacted_receipt,
             )
+        trusted_paste_evidence = paste_res.has_trusted_confirmation_evidence
+        evidence.log_event(
+            "paste_flow_completed",
+            {
+                "confirmation_evidence": paste_res.effective_confirmation_evidence,
+                "client_text_match": paste_res.client_text_match,
+                "trusted_paste_evidence": trusted_paste_evidence,
+            },
+        )
         steps.append("paste_flow_completed")
 
         # 8. Fresh observe + OCR verification of exact title, pasted text, and absence of premature bubble
@@ -335,6 +345,8 @@ class SendMessageWorkflow:
                 active_input_box,
                 clean_text,
                 allow_upward_growth=False,
+                before_image_bytes=pre_paste_image_bytes,
+                trusted_paste_evidence=trusted_paste_evidence,
             )
         else:
             active_input_box = focused.input_box
@@ -345,6 +357,8 @@ class SendMessageWorkflow:
                 active_input_box,
                 clean_text,
                 allow_upward_growth=True,
+                before_image_bytes=pre_paste_image_bytes,
+                trusted_paste_evidence=trusted_paste_evidence,
             )
         if not text_ok:
             return report(
@@ -455,6 +469,8 @@ class SendMessageWorkflow:
                 fresh_input,
                 clean_text,
                 allow_upward_growth=(focused_now is None),
+                before_image_bytes=pre_paste_image_bytes,
+                trusted_paste_evidence=trusted_paste_evidence,
             )
             if not ok_text:
                 raise SendPreconditionError(

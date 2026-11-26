@@ -1275,3 +1275,249 @@ def test_enter_send_recovers_short_tail_occluded_by_green_caret_via_crop_fallbac
     assert len([c for c in driver2.calls if c[0] == "send_enter_key"]) == 0
 
 
+def test_enter_send_honors_trusted_confirmation_evidence_for_corner_fade_and_blocks_without_it(
+    tmp_path: Path,
+) -> None:
+    import io
+
+    from PIL import Image, ImageDraw
+
+    from wechat_agent.vision.wechat_ui import detect_keyboard_and_focused_input, prepare_input_box_ocr_crop
+
+    msg = "这个得赶紧找群主确认，没发货前一般还能协调改，具体看订单状态。"
+    empty_pill = Box(0.132, 0.528, 0.764, 0.576)
+    pasted_pill = Box(0.132, 0.482, 0.764, 0.576)
+    row1_sub_box = Box(0.158, 0.514, 0.712, 0.542)
+
+    focused_empty_base = make_keyboard_chat_image(
+        w=500,
+        h=1080,
+        blue_send=False,
+        with_caret=True,
+        with_right_mic_icon=False,
+        input_box=empty_pill,
+    )
+    with Image.open(io.BytesIO(focused_empty_base)) as bimg:
+        brgb = bimg.convert("RGB")
+        ImageDraw.Draw(brgb).rounded_rectangle(
+            [int(round(0.692 * 500)), int(round(0.543 * 1080)), int(round(0.720 * 500)), int(round(0.562 * 1080))],
+            radius=4,
+            fill=(77, 75, 78),
+        )
+        bbuf = io.BytesIO()
+        brgb.save(bbuf, format="PNG")
+        focused_empty_img = bbuf.getvalue()
+
+    base_pasted = make_keyboard_chat_image(
+        w=500,
+        h=1080,
+        blue_send=True,
+        with_caret=True,
+        with_right_mic_icon=False,
+        input_box=pasted_pill,
+    )
+    with Image.open(io.BytesIO(base_pasted)) as img:
+        rgb = img.convert("RGB")
+        draw = ImageDraw.Draw(rgb)
+        w, h = rgb.size
+        draw.rounded_rectangle(
+            [int(round(0.692 * w)), int(round(0.543 * h)), int(round(0.720 * w)), int(round(0.562 * h))],
+            radius=4,
+            fill=(77, 75, 78),
+        )
+        x0 = int(round(row1_sub_box.left * w))
+        y0 = int(round(row1_sub_box.top * h))
+        x1 = int(round(row1_sub_box.right * w))
+        y1 = int(round(row1_sub_box.bottom * h))
+        cw = max(14, round((x1 - x0) / 12))
+        mid_y = (y0 + y1) // 2
+        draw.rectangle([x0 + 4, y0 + 3, max(x0 + 10, x1 - cw - 4), y1 - 3], fill=(12, 12, 12))
+        draw.rectangle([max(x0, x1 - cw), y0 + 2, x1, mid_y], fill=(80, 80, 80))
+        draw.rectangle([max(x0, x1 - cw), mid_y, x1, y1 - 2], fill=(180, 180, 180))
+        buf = io.BytesIO()
+        rgb.save(buf, format="PNG")
+        pasted_fade_img = buf.getvalue()
+
+    pre_enter_fade_img = pasted_fade_img + b"fresh-pre-enter"
+    sent_img = make_collapsed_chat_image(outgoing_boxes=[Box(0.55, 0.40, 0.90, 0.46)])
+
+    common_header = OcrBox("文件传输助手", Box(0.35, 0.06, 0.65, 0.09))
+    empty_boxes = [
+        common_header,
+        OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+        OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+    ]
+    post_paste_fade_boxes = [
+        common_header,
+        OcrBox("这个得赶紧找群主确认，没", Box(0.158, 0.492, 0.712, 0.515)),
+        OcrBox("发货前一般还能协调改，目", row1_sub_box),
+        OcrBox("体看订单状态。", Box(0.158, 0.542, 0.460, 0.565)),
+        OcrBox("0", Box(0.688, 0.542, 0.722, 0.560)),
+        OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+        OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+    ]
+    sent_boxes = [
+        common_header,
+        OcrBox(msg, Box(0.58, 0.415, 0.86, 0.445)),
+    ]
+
+    # Part A: Trusted confirmation_evidence="direct_paste_verified" passes 04_post_paste + 05_pre_enter (including
+    # 2x crop omit recovery if pre_enter misses '目') -> single send_enter_key -> SENT_CONFIRMED.
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    ocr.register(focused_empty_img, empty_boxes)
+    ocr.register(pasted_fade_img, post_paste_fade_boxes)
+    ocr.register(sent_img, sent_boxes)
+
+    # On 05_pre_enter, simulate omit-style fade inside 2x crop triggered by a transient tail drop on full frame
+    pre_enter_incomplete_full = [
+        common_header,
+        OcrBox("这个得赶紧找群主确认，没", Box(0.158, 0.492, 0.712, 0.515)),
+        OcrBox("发货前一般还能协调改，目", row1_sub_box),
+        OcrBox("体看订单状态", Box(0.158, 0.542, 0.440, 0.565)),
+        OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+        OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+    ]
+    ocr.register(pre_enter_fade_img, pre_enter_incomplete_full)
+    # Build pixel-accurate omit image for pre-enter crop test
+    with Image.open(io.BytesIO(base_pasted)) as img2:
+        rgb2 = img2.convert("RGB")
+        d2 = ImageDraw.Draw(rgb2)
+        d2.rounded_rectangle(
+            [int(round(0.692 * w)), int(round(0.543 * h)), int(round(0.720 * w)), int(round(0.562 * h))],
+            radius=4,
+            fill=(77, 75, 78),
+        )
+        omit_row1 = Box(0.158, 0.514, 0.635, 0.542)
+        ox0 = int(round(omit_row1.left * w))
+        oy0 = int(round(omit_row1.top * h))
+        ox1 = int(round(omit_row1.right * w))
+        oy1 = int(round(omit_row1.bottom * h))
+        omid = (oy0 + oy1) // 2
+        ocw = max(14, round((ox1 - ox0) / 11))
+        d2.rectangle([ox0 + 4, oy0 + 3, ox1 - 4, oy1 - 3], fill=(12, 12, 12))
+        d2.rectangle([ox1 + 2, oy0 + 2, min(int(round(pasted_pill.right * w)) - 2, ox1 + ocw), omid], fill=(90, 90, 90))
+        d2.rectangle(
+            [ox1 + 2, omid, min(int(round(pasted_pill.right * w)) - 2, ox1 + ocw), oy1 - 2],
+            fill=(175, 175, 175),
+        )
+        b2 = io.BytesIO()
+        rgb2.save(b2, format="PNG")
+        pre_enter_omit_img = b2.getvalue()
+
+    ocr.register(pre_enter_omit_img, pre_enter_incomplete_full)
+    focused_omit = detect_keyboard_and_focused_input(pre_enter_omit_img, pre_enter_incomplete_full)
+    assert focused_omit is not None
+    prep_omit = prepare_input_box_ocr_crop(pre_enter_omit_img, focused_omit.input_box, allow_upward_growth=False)
+    assert prep_omit is not None
+    crop_omit_bytes, _ = prep_omit
+    ocr.register(
+        crop_omit_bytes,
+        [
+            OcrBox("这个得赶紧找群主确认，没", Box(0.06, 0.12, 0.88, 0.36)),
+            OcrBox("发货前一般还能协调改，", Box(0.06, 0.382, 0.785, 0.607)),
+            OcrBox("体看订单状态。", Box(0.06, 0.63, 0.50, 0.86)),
+        ],
+    )
+
+    driver.paste_flow_handler = lambda *a, **kw: PasteFlowResult(
+        ok=True,
+        cmd_v_sent=1,
+        phase="completed",
+        effect_verified=True,
+        recovery_state=PasteRecoveryState.COMPLETED,
+        confirmation_evidence="direct_paste_verified",
+        client_text_match="corner_fade",
+        raw={
+            "cmd_v_sent": 1,
+            "phase": "completed",
+            "effect_verified": True,
+            "recovery_state": "completed",
+            "confirmation_evidence": "direct_paste_verified",
+            "client_text_verified": True,
+            "client_text_match": "corner_fade",
+        },
+    )
+    driver.observe_queue = [
+        Observation(screen_id="scr-kb", image_bytes=focused_empty_img),
+        Observation(screen_id="scr-pasted", image_bytes=pasted_fade_img),
+        Observation(screen_id="scr-pe", image_bytes=pre_enter_omit_img),
+    ]
+    driver.key_action_handler = lambda sid, scope: KeyActionResult(
+        screen_id="scr-sent",
+        command_acknowledged=True,
+        action_may_have_executed=True,
+        image_bytes=sent_img,
+    )
+    rep = SendMessageWorkflow(driver, ocr, _config(tmp_path)).run("文件传输助手", msg, send=True)
+    assert rep.status == SendStatus.SENT_CONFIRMED
+    assert len([c for c in driver.calls if c[0] == "send_enter_key"]) == 1
+
+    # Part B: Without confirmation_evidence (or with client_text_verified=False), exact same fade frame MUST abort.
+    for bad_raw in (
+        {"cmd_v_sent": 1, "phase": "completed", "effect_verified": True, "recovery_state": "completed"},
+        {
+            "cmd_v_sent": 1,
+            "phase": "completed",
+            "effect_verified": True,
+            "recovery_state": "completed",
+            "confirmation_evidence": "direct_paste_verified",
+            "client_text_verified": False,
+        },
+    ):
+        driver_bad = FakePhoneDriver()
+        driver_bad.paste_flow_handler = lambda *a, r=bad_raw, **kw: PasteFlowResult(
+            ok=True,
+            cmd_v_sent=1,
+            phase="completed",
+            effect_verified=True,
+            recovery_state=PasteRecoveryState.COMPLETED,
+            confirmation_evidence=str(r.get("confirmation_evidence") or ""),
+            raw=r,
+        )
+        driver_bad.observe_queue = [
+            Observation(screen_id="scr-kb-b", image_bytes=focused_empty_img),
+            Observation(screen_id="scr-pasted-b", image_bytes=pasted_fade_img),
+        ]
+        rep_bad = SendMessageWorkflow(driver_bad, ocr, _config(tmp_path)).run("文件传输助手", msg, send=True)
+        assert rep_bad.status == SendStatus.ABORTED_PASTE_VERIFY
+        assert len([c for c in driver_bad.calls if c[0] == "send_enter_key"]) == 0
+
+    # Part C: Even WITH confirmation_evidence="direct_paste_verified", amount/digit/negation mismatch MUST abort.
+    for risk_msg, risk_obs_row1 in (
+        (
+            "请核对订单金额共199元后再发货前一般还能协调改，具体看订单状态。",
+            "发货前一般还能协调改，目",
+        ),
+        (
+            "这个得赶紧找群主确认，没发货前一般还能协调没有看订单状态。",
+            "发货前一般还能协调有",
+        ),
+    ):
+        driver_risk = FakePhoneDriver()
+        ocr_risk = MockOcrEngine()
+        ocr_risk.register(focused_empty_img, empty_boxes)
+        risk_pasted = pasted_fade_img + risk_msg.encode("utf-8")
+        ocr_risk.register(
+            risk_pasted,
+            [
+                common_header,
+                OcrBox(risk_msg[:12], Box(0.158, 0.492, 0.712, 0.515)),
+                OcrBox(risk_obs_row1, row1_sub_box),
+                OcrBox("体看订单状态。" if "具体" in risk_msg else "看订单状态。", Box(0.158, 0.542, 0.460, 0.565)),
+                OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+                OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+            ],
+        )
+        driver_risk.paste_flow_handler = driver.paste_flow_handler
+        driver_risk.observe_queue = [
+            Observation(screen_id="scr-kb-r", image_bytes=focused_empty_img),
+            Observation(screen_id="scr-pasted-r", image_bytes=risk_pasted),
+        ]
+        rep_risk = SendMessageWorkflow(driver_risk, ocr_risk, _config(tmp_path)).run(
+            "文件传输助手", risk_msg, send=True
+        )
+        assert rep_risk.status == SendStatus.ABORTED_PASTE_VERIFY
+        assert len([c for c in driver_risk.calls if c[0] == "send_enter_key"]) == 0
+
+
