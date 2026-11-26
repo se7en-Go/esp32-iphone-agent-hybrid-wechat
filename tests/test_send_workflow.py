@@ -1420,7 +1420,7 @@ def test_enter_send_honors_trusted_confirmation_evidence_for_corner_fade_and_blo
         ],
     )
 
-    driver.paste_flow_handler = lambda *a, **kw: PasteFlowResult(
+    trusted_paste_handler = lambda *a, **kw: PasteFlowResult(  # noqa: E731
         ok=True,
         cmd_v_sent=1,
         phase="completed",
@@ -1438,10 +1438,10 @@ def test_enter_send_honors_trusted_confirmation_evidence_for_corner_fade_and_blo
             "client_text_match": "corner_fade",
         },
     )
+    driver.paste_flow_handler = trusted_paste_handler
     driver.observe_queue = [
         Observation(screen_id="scr-kb", image_bytes=focused_empty_img),
-        Observation(screen_id="scr-pasted", image_bytes=pasted_fade_img),
-        Observation(screen_id="scr-pe", image_bytes=pre_enter_omit_img),
+        Observation(screen_id="scr-pe-sub", image_bytes=pasted_fade_img),
     ]
     driver.key_action_handler = lambda sid, scope: KeyActionResult(
         screen_id="scr-sent",
@@ -1452,6 +1452,22 @@ def test_enter_send_honors_trusted_confirmation_evidence_for_corner_fade_and_blo
     rep = SendMessageWorkflow(driver, ocr, _config(tmp_path)).run("文件传输助手", msg, send=True)
     assert rep.status == SendStatus.SENT_CONFIRMED
     assert len([c for c in driver.calls if c[0] == "send_enter_key"]) == 1
+    assert len([c for c in driver.calls if c[0] == "observe"]) == 2
+    call_names = [c[0] for c in driver.calls]
+    assert call_names.index("skill_prepare_send") < [i for i, n in enumerate(call_names) if n == "observe"][1]
+
+    # Also verify 2x crop omit recovery on the single streamlined pre-enter frame
+    driver_omit = FakePhoneDriver()
+    driver_omit.paste_flow_handler = trusted_paste_handler
+    driver_omit.observe_queue = [
+        Observation(screen_id="scr-kb-omit", image_bytes=focused_empty_img),
+        Observation(screen_id="scr-pe-omit", image_bytes=pre_enter_omit_img),
+    ]
+    driver_omit.key_action_handler = driver.key_action_handler
+    rep_omit = SendMessageWorkflow(driver_omit, ocr, _config(tmp_path)).run("文件传输助手", msg, send=True)
+    assert rep_omit.status == SendStatus.SENT_CONFIRMED
+    assert len([c for c in driver_omit.calls if c[0] == "send_enter_key"]) == 1
+    assert len([c for c in driver_omit.calls if c[0] == "observe"]) == 2
 
     # Part B: Without confirmation_evidence (or with client_text_verified=False), exact same fade frame MUST abort.
     for bad_raw in (
@@ -1509,7 +1525,7 @@ def test_enter_send_honors_trusted_confirmation_evidence_for_corner_fade_and_blo
                 OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
             ],
         )
-        driver_risk.paste_flow_handler = driver.paste_flow_handler
+        driver_risk.paste_flow_handler = trusted_paste_handler
         driver_risk.observe_queue = [
             Observation(screen_id="scr-kb-r", image_bytes=focused_empty_img),
             Observation(screen_id="scr-pasted-r", image_bytes=risk_pasted),
@@ -1519,5 +1535,254 @@ def test_enter_send_honors_trusted_confirmation_evidence_for_corner_fade_and_blo
         )
         assert rep_risk.status == SendStatus.ABORTED_PASTE_VERIFY
         assert len([c for c in driver_risk.calls if c[0] == "send_enter_key"]) == 0
+
+
+def test_enter_send_safe_pre_hid_unacknowledged_result_retries_and_blocks_uncertain_cases(
+    tmp_path: Path,
+) -> None:
+    def _trusted_paste(*a, **kw) -> PasteFlowResult:
+        return PasteFlowResult(
+            ok=True,
+            cmd_v_sent=1,
+            phase="completed",
+            effect_verified=True,
+            recovery_state=PasteRecoveryState.COMPLETED,
+            confirmation_evidence="direct_paste_verified",
+            raw={
+                "cmd_v_sent": 1,
+                "phase": "completed",
+                "effect_verified": True,
+                "recovery_state": "completed",
+                "confirmation_evidence": "direct_paste_verified",
+                "client_text_verified": True,
+            },
+        )
+
+    # Case 1: HTTP 200 command_acknowledged=False + action_may_have_executed=False + "screen changed since..."
+    # safely re-observes & retries send_enter_key up to enter_send_409_retries.
+    driver = FakePhoneDriver()
+    ocr = MockOcrEngine()
+    frames = _register_happy_chat_flow(driver, ocr, message_text="安全写前重试", bubble_after_send=True)
+    driver.paste_flow_handler = _trusted_paste
+    driver.observe_queue = [
+        Observation(screen_id="scr-kb", image_bytes=frames["focused_empty"]),
+        Observation(screen_id="scr-pe-1", image_bytes=frames["pasted"]),
+        Observation(screen_id="scr-pe-2", image_bytes=frames["pasted"]),
+    ]
+    enter_attempts = {"n": 0}
+
+    def handle_enter_safe(sid, scope):
+        enter_attempts["n"] += 1
+        if enter_attempts["n"] == 1:
+            return KeyActionResult(
+                screen_id=None,
+                command_acknowledged=False,
+                action_may_have_executed=False,
+                error="screen changed since the original observation; observe again before acting",
+            )
+        return KeyActionResult(
+            screen_id="scr-sent",
+            command_acknowledged=True,
+            action_may_have_executed=True,
+            image_bytes=frames["sent"],
+        )
+
+    driver.key_action_handler = handle_enter_safe
+    rep = SendMessageWorkflow(driver, ocr, _config(tmp_path)).run("文件传输助手", "安全写前重试", send=True)
+    assert rep.status == SendStatus.SENT_CONFIRMED
+    enter_calls = [args for name, args in driver.calls if name == "send_enter_key"]
+    assert [c["screen_id"] for c in enter_calls] == ["scr-pe-1", "scr-pe-2"]
+    assert len([c for c in driver.calls if c[0] == "skill_confirm_send"]) == 1
+
+    # Case 2: Re-observed screen already shows matching outgoing bubble -> abort without 2nd enter
+    driver2 = FakePhoneDriver()
+    ocr2 = MockOcrEngine()
+    frames2 = _register_happy_chat_flow(driver2, ocr2, message_text="重试发现已发气泡", bubble_after_send=True)
+    kb_with_bubble = make_keyboard_chat_image(
+        blue_send=True,
+        with_caret=True,
+        outgoing_boxes=[Box(0.55, 0.35, 0.90, 0.41)],
+    )
+    ocr2.register(
+        kb_with_bubble,
+        [
+            OcrBox("文件传输助手", Box(0.35, 0.06, 0.65, 0.09)),
+            OcrBox("重试发现已发气泡", Box(0.58, 0.365, 0.86, 0.395)),
+            OcrBox("重试发现已发气泡", Box(0.18, 0.53, 0.52, 0.55)),
+            OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+            OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+        ],
+    )
+    driver2.paste_flow_handler = _trusted_paste
+    driver2.observe_queue = [
+        Observation(screen_id="scr-kb2", image_bytes=frames2["focused_empty"]),
+        Observation(screen_id="scr-pe2-1", image_bytes=frames2["pasted"]),
+        Observation(screen_id="scr-pe2-2-bubble", image_bytes=kb_with_bubble),
+    ]
+    driver2.key_action_handler = lambda sid, scope: KeyActionResult(
+        screen_id=None,
+        command_acknowledged=False,
+        action_may_have_executed=False,
+        error="screen changed since the original observation; observe again before acting",
+    )
+    rep2 = SendMessageWorkflow(driver2, ocr2, _config(tmp_path)).run("文件传输助手", "重试发现已发气泡", send=True)
+    assert rep2.status == SendStatus.SEND_UNCONFIRMED
+    assert len([c for c in driver2.calls if c[0] == "send_enter_key"]) == 1
+
+    # Case 3: Retry budget exhausted -> halts SEND_UNCONFIRMED cleanly
+    driver3 = FakePhoneDriver()
+    ocr3 = MockOcrEngine()
+    frames3 = _register_happy_chat_flow(driver3, ocr3, message_text="重试耗尽停机", bubble_after_send=True)
+    driver3.paste_flow_handler = _trusted_paste
+    driver3.observe_queue = [
+        Observation(screen_id="scr-kb3", image_bytes=frames3["focused_empty"]),
+        Observation(screen_id="scr-pe3-0", image_bytes=frames3["pasted"]),
+        Observation(screen_id="scr-pe3-1", image_bytes=frames3["pasted"]),
+        Observation(screen_id="scr-pe3-2", image_bytes=frames3["pasted"]),
+    ]
+    driver3.key_action_handler = lambda sid, scope: KeyActionResult(
+        screen_id=None,
+        command_acknowledged=False,
+        action_may_have_executed=False,
+        error="screen changed since the original observation; observe again before acting",
+    )
+    rep3 = SendMessageWorkflow(driver3, ocr3, _config(tmp_path, enter_send_409_retries=2)).run(
+        "文件传输助手", "重试耗尽停机", send=True
+    )
+    assert rep3.status == SendStatus.SEND_UNCONFIRMED
+    assert len([c for c in driver3.calls if c[0] == "send_enter_key"]) == 3
+    assert len([c for c in driver3.calls if c[0] == "skill_confirm_send"]) == 0
+
+    # Case 4: Forbidden retry cases MUST make exactly 1 attempt and zero confirm_send calls
+    forbidden_cases = [
+        KeyActionResult(
+            screen_id=None,
+            command_acknowledged=False,
+            action_may_have_executed=True,
+            error="screen changed since the original observation",
+        ),
+        KeyActionResult(
+            screen_id=None,
+            command_acknowledged=False,
+            action_may_have_executed=None,
+            error="screen changed since the original observation",
+        ),
+        KeyActionResult(
+            screen_id=None,
+            command_acknowledged=False,
+            action_may_have_executed=False,
+            error="phone is busy",
+        ),
+        KeyActionResult(
+            screen_id=None,
+            command_acknowledged=False,
+            action_may_have_executed=False,
+            error="",
+        ),
+    ]
+    for bad_res in forbidden_cases:
+        driver_f = FakePhoneDriver()
+        ocr_f = MockOcrEngine()
+        frames_f = _register_happy_chat_flow(driver_f, ocr_f, message_text="禁止重试")
+        driver_f.paste_flow_handler = _trusted_paste
+        driver_f.observe_queue = [
+            Observation(screen_id="scr-kbf", image_bytes=frames_f["focused_empty"]),
+            Observation(screen_id="scr-pef", image_bytes=frames_f["pasted"]),
+        ]
+        driver_f.key_action_handler = lambda sid, scope, r=bad_res: r
+        rep_f = SendMessageWorkflow(driver_f, ocr_f, _config(tmp_path)).run("文件传输助手", "禁止重试", send=True)
+        assert rep_f.status == SendStatus.SEND_UNCONFIRMED
+        assert len([c for c in driver_f.calls if c[0] == "send_enter_key"]) == 1
+        assert len([c for c in driver_f.calls if c[0] == "skill_confirm_send"]) == 0
+
+
+def test_streamlined_enter_send_keeps_dry_run_independent_and_preserves_safety_gates(
+    tmp_path: Path,
+) -> None:
+    def _trusted_paste(*a, **kw) -> PasteFlowResult:
+        return PasteFlowResult(
+            ok=True,
+            cmd_v_sent=1,
+            phase="completed",
+            effect_verified=True,
+            recovery_state=PasteRecoveryState.COMPLETED,
+            confirmation_evidence="direct_paste_verified",
+            raw={
+                "cmd_v_sent": 1,
+                "phase": "completed",
+                "effect_verified": True,
+                "recovery_state": "completed",
+                "confirmation_evidence": "direct_paste_verified",
+                "client_text_verified": True,
+            },
+        )
+
+    # 1. --dry-run STILL runs standalone post-paste check with zero prepare_send / send_enter_key calls
+    driver_dry = FakePhoneDriver()
+    ocr_dry = MockOcrEngine()
+    frames_dry = _register_happy_chat_flow(driver_dry, ocr_dry, message_text="干跑保持独立校验")
+    driver_dry.paste_flow_handler = _trusted_paste
+    driver_dry.observe_queue = [
+        Observation(screen_id="scr-kb", image_bytes=frames_dry["focused_empty"]),
+        Observation(screen_id="scr-post", image_bytes=frames_dry["pasted"]),
+    ]
+    rep_dry = SendMessageWorkflow(driver_dry, ocr_dry, _config(tmp_path)).run(
+        "文件传输助手", "干跑保持独立校验", send=False
+    )
+    assert rep_dry.status == SendStatus.DRY_RUN_READY
+    assert len([c for c in driver_dry.calls if c[0] == "observe"]) == 2
+    assert not any(c[0] in {"skill_prepare_send", "send_enter_key"} for c in driver_dry.calls)
+
+    # 2. Streamlined --send STILL blocks wrong chat title, grey Send key, or premature matching green bubble
+    bad_wrong_title = make_keyboard_chat_image(blue_send=True, with_caret=True) + b"wrong-title"
+    ocr_dry.register(
+        bad_wrong_title,
+        [
+            OcrBox("陌生人的私聊", Box(0.35, 0.06, 0.65, 0.09)),
+            OcrBox("安全校验不降级", Box(0.18, 0.53, 0.52, 0.55)),
+            OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+            OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+        ],
+    )
+    bad_grey_send = make_keyboard_chat_image(blue_send=False, with_caret=True) + b"grey-send"
+    ocr_dry.register(
+        bad_grey_send,
+        [
+            OcrBox("文件传输助手", Box(0.35, 0.06, 0.65, 0.09)),
+            OcrBox("安全校验不降级", Box(0.18, 0.53, 0.52, 0.55)),
+            OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+            OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+        ],
+    )
+    bad_dup_bubble = make_keyboard_chat_image(
+        blue_send=True,
+        with_caret=True,
+        outgoing_boxes=[Box(0.55, 0.35, 0.90, 0.41)],
+    )
+    ocr_dry.register(
+        bad_dup_bubble,
+        [
+            OcrBox("文件传输助手", Box(0.35, 0.06, 0.65, 0.09)),
+            OcrBox("安全校验不降级", Box(0.58, 0.365, 0.86, 0.395)),
+            OcrBox("安全校验不降级", Box(0.18, 0.53, 0.52, 0.55)),
+            OcrBox("空格", Box(0.45, 0.885, 0.53, 0.905)),
+            OcrBox("发送", Box(0.84, 0.885, 0.90, 0.905)),
+        ],
+    )
+
+    for bad_frame, expected_status in (
+        (bad_wrong_title, SendStatus.ABORTED_PASTE_VERIFY),
+        (bad_grey_send, SendStatus.ABORTED_SEND_BUTTON),
+        (bad_dup_bubble, SendStatus.SEND_UNCONFIRMED),
+    ):
+        d = FakePhoneDriver()
+        d.paste_flow_handler = _trusted_paste
+        d.observe_queue = [
+            Observation(screen_id="scr-kb-bad", image_bytes=frames_dry["focused_empty"]),
+            Observation(screen_id="scr-pe-bad", image_bytes=bad_frame),
+        ]
+        r = SendMessageWorkflow(d, ocr_dry, _config(tmp_path)).run("文件传输助手", "安全校验不降级", send=True)
+        assert r.status == expected_status
+        assert len([c for c in d.calls if c[0] == "send_enter_key"]) == 0
 
 
