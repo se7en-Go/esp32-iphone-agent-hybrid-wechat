@@ -1,7 +1,7 @@
 ---
-min_interval_seconds: 10
-max_per_hour: 15
-quiet_hours: "23:00-07:00"
+min_interval_seconds: 5
+max_per_hour: 30
+quiet_hours: "off"
 extra_stop: "账号异常,功能受限,发送失败,消息发出失败,安全提示,验证身份,登录过期,已被限制"
 ---
 

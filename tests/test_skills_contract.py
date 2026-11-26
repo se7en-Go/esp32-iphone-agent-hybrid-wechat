@@ -19,9 +19,19 @@ def test_repo_skills_valid_and_no_static_layouts() -> None:
 def test_wechat_send_frontmatter_parses_like_base_server() -> None:
     md = (repo_root() / "skills" / "wechat-send" / "SKILL.md").read_text(encoding="utf-8")
     meta = parse_skill_frontmatter(md)
-    assert meta["min_interval_seconds"] >= 3.0
-    assert 1 <= meta["max_per_hour"] <= 30
-    assert meta["quiet_hours"] == "23:00-07:00"
+    assert meta["min_interval_seconds"] == 5.0
+    assert meta["max_per_hour"] == 30
+    assert meta["quiet_hours"] == "off"
+    assert "账号异常" in meta["extra_stop"]
+    assert "功能受限" in meta["extra_stop"]
+
+
+def test_wechat_group_reply_frontmatter_parses_like_base_server() -> None:
+    md = (repo_root() / "skills" / "wechat-group-reply" / "SKILL.md").read_text(encoding="utf-8")
+    meta = parse_skill_frontmatter(md)
+    assert meta["min_interval_seconds"] == 5.0
+    assert meta["max_per_hour"] == 30
+    assert meta["quiet_hours"] == "off"
     assert "账号异常" in meta["extra_stop"]
     assert "功能受限" in meta["extra_stop"]
 
