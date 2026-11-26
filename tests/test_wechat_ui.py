@@ -921,7 +921,7 @@ def test_corner_fade_substitution_and_omission_compatibility_with_strict_securit
     full_bad_boxes = [
         OcrBox("这个得赶紧找群主确认，没", Box(0.158, 0.492, 0.712, 0.515)),
         OcrBox("发货前一般还能协调改，目", Box(0.158, 0.514, 0.712, 0.542)),
-        OcrBox("体看订单状态", Box(0.158, 0.542, 0.440, 0.565)),  # triggers fallback via wrong extra diff
+        OcrBox("体看订单状", Box(0.158, 0.542, 0.440, 0.565)),  # triggers fallback via wrong extra diff
     ]
     ocr.register(
         crop_bytes,
@@ -1104,6 +1104,189 @@ def test_corner_fade_substitution_and_omission_compatibility_with_strict_securit
         )[0]
         is False
     )
+
+
+def test_corner_fade_combined_with_bounded_thin_punctuation_omission() -> None:
+    pill = Box(0.130, 0.456, 0.764, 0.576)
+    expected = "在群里的官方团购小程序进「订单详情」就能看到物流单号；找不到的话联系群主帮你看下。"
+    before_sub, after_sub = _make_corner_fade_pair(
+        pill=pill,
+        row1_box=Box(0.158, 0.514, 0.716, 0.540),
+        omit_cell=False,
+        dark_tail=False,
+    )
+    sub_and_punct_boxes = [
+        OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+        OcrBox("「订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+        OcrBox("号；找不到的话联系群主都", Box(0.158, 0.514, 0.716, 0.540)),
+        OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+        OcrBox("U", Box(0.688, 0.542, 0.722, 0.560)),
+    ]
+
+    # Combined faded sub ('帮'->'都') + dropped thin bracket '」' passes ONLY with trusted evidence + physical fade
+    assert (
+        verify_pasted_text(
+            sub_and_punct_boxes,
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is True
+    )
+    assert (
+        verify_pasted_text(
+            sub_and_punct_boxes,
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=False,
+        )[0]
+        is False
+    )
+    _, after_dark = _make_corner_fade_pair(
+        pill=pill,
+        row1_box=Box(0.158, 0.514, 0.716, 0.540),
+        omit_cell=False,
+        dark_tail=True,
+    )
+    assert (
+        verify_pasted_text(
+            sub_and_punct_boxes,
+            pill,
+            expected,
+            image_bytes=after_dark,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+    # Combined faded omit ('帮'->'') + dropped '」' passes with physical omit fade cell
+    before_omit, after_omit = _make_corner_fade_pair(
+        pill=pill,
+        row1_box=Box(0.158, 0.514, 0.635, 0.540),
+        omit_cell=True,
+        dark_tail=False,
+    )
+    omit_and_punct_boxes = [
+        OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+        OcrBox("「订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+        OcrBox("号；找不到的话联系群主", Box(0.158, 0.514, 0.635, 0.540)),
+        OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+    ]
+    assert (
+        verify_pasted_text(
+            omit_and_punct_boxes,
+            pill,
+            expected,
+            image_bytes=after_omit,
+            before_image_bytes=before_omit,
+            trusted_paste_evidence=True,
+        )[0]
+        is True
+    )
+
+    # Negative 1: dropping a real CJK char ('情') alongside corner fade MUST fail
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+                OcrBox("「订单详就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+                OcrBox("号；找不到的话联系群主都", Box(0.158, 0.514, 0.716, 0.540)),
+                OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+            ],
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+    # Negative 2: dropping 3 thin punctuations ('「', '」', '；') alongside corner fade MUST fail
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+                OcrBox("订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+                OcrBox("号找不到的话联系群主都", Box(0.158, 0.514, 0.716, 0.540)),
+                OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+            ],
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+    # Negative 3: high-risk digit payload or protected negation/refund CJK alongside dropped '」' + fade MUST fail
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("订单实付199元请核对清楚", Box(0.160, 0.468, 0.711, 0.487)),
+                OcrBox("「订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+                OcrBox("号；找不到的话联系群主都", Box(0.158, 0.514, 0.716, 0.540)),
+                OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+            ],
+            pill,
+            "订单实付199元请核对清楚「订单详情」就能看到物流单号；找不到的话联系群主帮你看下。",
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+                OcrBox("「订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+                OcrBox("号；找不到的话先别自己都", Box(0.158, 0.514, 0.716, 0.540)),
+                OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+            ],
+            pill,
+            "在群里的官方团购小程序进「订单详情」就能看到物流单号；找不到的话先别自己退你看下。",
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+    # Negative 4: collapsed hard newline across two logical lines alongside dropped '」' + fade MUST fail
+    assert (
+        verify_pasted_text(
+            sub_and_punct_boxes,
+            pill,
+            "在群里的官方团购小程序进「订单详情」就能看到物流单号；找不到的话联系群主帮\n你看下。",
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is True
+    )
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+                OcrBox("「订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+                OcrBox("号；找不到的话联系群主都你看下。", Box(0.158, 0.514, 0.716, 0.540)),
+            ],
+            pill,
+            "在群里的官方团购小程序进「订单详情」就能看到物流单号；找不到的话联系群主帮\n你看下。",
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
 
 
 

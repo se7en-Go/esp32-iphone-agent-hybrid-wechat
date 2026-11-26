@@ -528,6 +528,8 @@ _OCR_PUNCT_RE = re.compile(
     r"[，,。？?！!、；;：:·•'\"‘’“”「」『』()（）\[\]【】—–\-_~…]+|(?<!\d)\.(?!\d)"
 )
 _TERMINAL_CJK_PUNCT = frozenset("。！？…")
+_CORNER_FADE_THIN_PUNCT = frozenset("「」『』《》〈〉“”‘’\"'()[]（）【】、，,；;：:。！？!?…·•")
+_MAX_CORNER_FADE_PUNCT_OMISSIONS = 2
 _MIN_CORNER_FADE_LEN = 15
 _HIGH_RISK_CORNER_FADE_TEXT_RE = re.compile(
     r"[0-9¥￥$%]|https?://|www\.|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+",
@@ -690,61 +692,87 @@ def _matches_corner_fade_rows(
     observed_raw: str,
     faded_rows: dict[int, str],
 ) -> bool:
-    """Allow at most 1 physically faded lower-right safe-CJK substitution/omission while keeping structure strict."""
-    if not faded_rows or not exp_lines or not obs_rows:
+    """Allow at most 1 physically faded lower-right safe-CJK sub/omit plus <=2 thin punct gaps."""
+    if not faded_rows or not exp_lines or not obs_rows or len(obs_rows) < len(exp_lines):
         return False
     total_exp = sum(len(line) for line in exp_lines)
     total_obs = sum(len(row) for row in obs_rows)
-    if total_exp < _MIN_CORNER_FADE_LEN or total_obs not in {total_exp, total_exp - 1}:
+    if (
+        total_exp < _MIN_CORNER_FADE_LEN
+        or total_obs > total_exp
+        or total_exp - total_obs > _MAX_CORNER_FADE_PUNCT_OMISSIONS + 1
+    ):
         return False
     if _HIGH_RISK_CORNER_FADE_TEXT_RE.search(expected_text) or _HIGH_RISK_CORNER_FADE_TEXT_RE.search(observed_raw):
         return False
 
-    idx = 0
+    row_idx = 0
+    omitted_punct = 0
     fade_used = False
     for line in exp_lines:
         pos = 0
+        consumed_rows = 0
         while pos < len(line):
-            if idx >= len(obs_rows):
+            if row_idx >= len(obs_rows):
                 return False
-            row = obs_rows[idx]
-            kind = faded_rows.get(idx)
-            if (
-                total_obs == total_exp - 1
-                and not fade_used
-                and kind == "omit"
-                and len(row) >= 4
-                and pos + len(row) < len(line)
-                and line[pos : pos + len(row)] == row
-            ):
-                omitted = line[pos + len(row)]
-                if _is_safe_fade_cjk(omitted):
+            row = obs_rows[row_idx]
+            k = 0
+            while k < len(row):
+                if pos < len(line) and row[k] == line[pos]:
+                    k += 1
+                    pos += 1
+                elif (
+                    pos < len(line)
+                    and line[pos] in _CORNER_FADE_THIN_PUNCT
+                    and omitted_punct < _MAX_CORNER_FADE_PUNCT_OMISSIONS
+                ):
+                    omitted_punct += 1
+                    pos += 1
+                elif (
+                    k == len(row) - 1
+                    and len(row) >= 4
+                    and pos < len(line)
+                    and not fade_used
+                    and faded_rows.get(row_idx) == "sub"
+                    and _is_safe_fade_cjk(line[pos])
+                    and _is_safe_fade_cjk(row[k])
+                ):
                     fade_used = True
-                    pos += len(row) + 1
-                    idx += 1
-                    continue
-            chunk = line[pos : pos + len(row)]
-            if len(chunk) != len(row):
-                return False
-            if row == chunk:
-                pos += len(row)
-                idx += 1
-                continue
+                    k += 1
+                    pos += 1
+                else:
+                    return False
+
             if (
-                total_obs == total_exp
+                pos < len(line)
                 and not fade_used
-                and kind == "sub"
                 and len(row) >= 4
-                and row[:-1] == chunk[:-1]
-                and _is_safe_fade_cjk(chunk[-1])
-                and _is_safe_fade_cjk(row[-1])
+                and faded_rows.get(row_idx) == "omit"
+                and _is_safe_fade_cjk(line[pos])
+                and (
+                    (row_idx + 1 >= len(obs_rows) and all(ch in _CORNER_FADE_THIN_PUNCT for ch in line[pos + 1 :]))
+                    or (row_idx + 1 < len(obs_rows) and obs_rows[row_idx + 1][0] != line[pos])
+                )
             ):
                 fade_used = True
-                pos += len(row)
-                idx += 1
-                continue
+                pos += 1
+
+            while (
+                pos < len(line)
+                and line[pos] in _CORNER_FADE_THIN_PUNCT
+                and omitted_punct < _MAX_CORNER_FADE_PUNCT_OMISSIONS
+            ):
+                if row_idx + 1 >= len(obs_rows) or obs_rows[row_idx + 1][0] != line[pos]:
+                    omitted_punct += 1
+                    pos += 1
+                else:
+                    break
+
+            row_idx += 1
+            consumed_rows += 1
+        if consumed_rows == 0:
             return False
-    return idx == len(obs_rows) and fade_used
+    return row_idx == len(obs_rows) and fade_used
 
 
 def _group_visual_rows(items: list[OcrBox]) -> list[list[OcrBox]]:
