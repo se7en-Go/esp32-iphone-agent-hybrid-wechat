@@ -12,6 +12,7 @@ from wechat_agent.guards.skill_guard import SkillGuard
 from wechat_agent.guards.target_policy import PolicyViolationError, TargetPolicy
 from wechat_agent.models import (
     Box,
+    KeyActionResult,
     Observation,
     SendReport,
     SendStatus,
@@ -40,7 +41,16 @@ def _is_safe_pre_hid_enter_409(exc: ConflictError) -> bool:
         return False
     if exc.raw.get("action_may_have_executed") is not False:
         return False
-    return "screen changed since the original observation" in (exc.detail or "").lower()
+    return "screen changed since" in (exc.detail or "").lower()
+
+
+def _is_safe_pre_hid_enter_result(key_res: KeyActionResult) -> bool:
+    """Return True ONLY when an unacknowledged Enter action definitely rejected before UART write."""
+    if key_res.command_acknowledged:
+        return False
+    if key_res.action_may_have_executed is not False:
+        return False
+    return "screen changed since" in (key_res.error or "").lower()
 
 
 class SendMessageWorkflow:
@@ -265,6 +275,7 @@ class SendMessageWorkflow:
                 observed_draft=existing_draft,
             )
         steps.append("draft_clean")
+        pre_paste_image_bytes = obs.image_bytes
 
         # 7. Single paste-flow execution (NEVER retry on failure)
         expect_header_title = (
@@ -293,102 +304,127 @@ class SendMessageWorkflow:
                 next_action=paste_res.next_action,
                 paste_receipt=redacted_receipt,
             )
+        trusted_paste_evidence = paste_res.has_trusted_confirmation_evidence
+        evidence.log_event(
+            "paste_flow_completed",
+            {
+                "confirmation_evidence": paste_res.effective_confirmation_evidence,
+                "client_text_match": paste_res.client_text_match,
+                "trusted_paste_evidence": trusted_paste_evidence,
+            },
+        )
         steps.append("paste_flow_completed")
 
-        # 8. Fresh observe + OCR verification of exact title, pasted text, and absence of premature bubble
-        try:
-            post_obs = self.driver.observe(image_output=evidence.image_output_path("04_post_paste"))
-            post_ocr = self.ocr.read_boxes(post_obs.image_bytes)
-            post_check = self.skill_guard.check_screen_text(post_ocr)
-        except DriverError as exc:
-            return report(
-                SendStatus.ABORTED_PASTE_VERIFY,
-                f"Post-paste observation failed: {exc}",
-                paste_receipt=redacted_receipt,
-            )
+        streamlined_enter_send = (
+            not dry_run
+            and self.config.send_method == "enter"
+            and trusted_paste_evidence
+        )
+        active_input_box = focused.input_box
+        post_obs: Observation | None = None
+        send_box: Box | None = None
+        send_label = ""
 
-        if post_check.stop:
-            return report(
-                SendStatus.ABORTED_RISK_PHRASE,
-                f"Circuit breaker triggered after paste: {post_check.reason}",
-                paste_receipt=redacted_receipt,
-            )
+        # 8-10. Full standalone 04_post_paste observe+OCR when dry-run, click-send, or untrusted paste receipt.
+        # For live enter-send with trusted base confirmation_evidence, go straight to prepare_send + single fresh frame.
+        if not streamlined_enter_send:
+            try:
+                post_obs = self.driver.observe(image_output=evidence.image_output_path("04_post_paste"))
+                post_ocr = self.ocr.read_boxes(post_obs.image_bytes)
+                post_check = self.skill_guard.check_screen_text(post_ocr)
+            except DriverError as exc:
+                return report(
+                    SendStatus.ABORTED_PASTE_VERIFY,
+                    f"Post-paste observation failed: {exc}",
+                    paste_receipt=redacted_receipt,
+                )
 
-        if not has_exact_chat_title(
-            post_ocr,
-            clean_target,
-            allow_group_count=self.config.allow_group_count,
-        ):
-            return report(
-                SendStatus.ABORTED_PASTE_VERIFY,
-                f"Conversation title verification failed after paste (expected {clean_target!r})",
-                paste_receipt=redacted_receipt,
-            )
+            if post_check.stop:
+                return report(
+                    SendStatus.ABORTED_RISK_PHRASE,
+                    f"Circuit breaker triggered after paste: {post_check.reason}",
+                    paste_receipt=redacted_receipt,
+                )
 
-        focused_post = detect_keyboard_and_focused_input(post_obs.image_bytes, post_ocr)
-        if focused_post is not None:
-            active_input_box = focused_post.input_box
-            text_ok, observed_pasted = verify_pasted_text_with_fallback(
-                self.ocr,
+            if not has_exact_chat_title(
+                post_ocr,
+                clean_target,
+                allow_group_count=self.config.allow_group_count,
+            ):
+                return report(
+                    SendStatus.ABORTED_PASTE_VERIFY,
+                    f"Conversation title verification failed after paste (expected {clean_target!r})",
+                    paste_receipt=redacted_receipt,
+                )
+
+            focused_post = detect_keyboard_and_focused_input(post_obs.image_bytes, post_ocr)
+            if focused_post is not None:
+                active_input_box = focused_post.input_box
+                text_ok, observed_pasted = verify_pasted_text_with_fallback(
+                    self.ocr,
+                    post_obs.image_bytes,
+                    post_ocr,
+                    active_input_box,
+                    clean_text,
+                    allow_upward_growth=False,
+                    before_image_bytes=pre_paste_image_bytes,
+                    trusted_paste_evidence=trusted_paste_evidence,
+                )
+            else:
+                active_input_box = focused.input_box
+                text_ok, observed_pasted = verify_pasted_text_with_fallback(
+                    self.ocr,
+                    post_obs.image_bytes,
+                    post_ocr,
+                    active_input_box,
+                    clean_text,
+                    allow_upward_growth=True,
+                    before_image_bytes=pre_paste_image_bytes,
+                    trusted_paste_evidence=trusted_paste_evidence,
+                )
+            if not text_ok:
+                return report(
+                    SendStatus.ABORTED_PASTE_VERIFY,
+                    f"Post-paste text mismatch or duplication (observed={observed_pasted!r}, expected={clean_text!r})",
+                    paste_receipt=redacted_receipt,
+                )
+
+            post_chat_area = Box(0.0, 0.13, 1.0, active_input_box.top - 0.01)
+            pre_send_bubbles = extract_outgoing_bubbles(post_obs.image_bytes, post_ocr, chat_area=post_chat_area)
+            if has_new_outgoing_bubble(baseline_bubbles, pre_send_bubbles, clean_text):
+                return report(
+                    SendStatus.ABORTED_PASTE_VERIFY,
+                    "Unexpected outgoing bubble appeared during paste before Send was clicked",
+                    paste_receipt=redacted_receipt,
+                )
+            steps.append("post_paste_verified")
+
+            # 9. Default --dry-run stops cleanly before Send
+            if dry_run:
+                return report(
+                    SendStatus.DRY_RUN_READY,
+                    "Dry-run completed: pasted text verified intact in input box; stopped before Send.",
+                    paste_receipt=redacted_receipt,
+                )
+
+            # 10. Explicit --send path (non-streamlined): locate dynamic blue Send button avoiding Space bar
+            require_blue_send = self.config.send_method == "enter"
+            send_loc = locate_blue_send_button(
                 post_obs.image_bytes,
                 post_ocr,
-                active_input_box,
-                clean_text,
-                allow_upward_growth=False,
+                require_blue=require_blue_send,
             )
-        else:
-            active_input_box = focused.input_box
-            text_ok, observed_pasted = verify_pasted_text_with_fallback(
-                self.ocr,
-                post_obs.image_bytes,
-                post_ocr,
-                active_input_box,
-                clean_text,
-                allow_upward_growth=True,
+            if send_loc is None:
+                return report(
+                    SendStatus.ABORTED_SEND_BUTTON,
+                    "Could not uniquely locate lower-right blue Send button on keyboard",
+                    paste_receipt=redacted_receipt,
+                )
+            send_box, send_label = send_loc
+            evidence.log_event(
+                "blue_send_button_located",
+                {"label": send_label, "send_box": send_box.as_list(), "send_method": self.config.send_method},
             )
-        if not text_ok:
-            return report(
-                SendStatus.ABORTED_PASTE_VERIFY,
-                f"Post-paste text mismatch or duplication (observed={observed_pasted!r}, expected={clean_text!r})",
-                paste_receipt=redacted_receipt,
-            )
-
-        post_chat_area = Box(0.0, 0.13, 1.0, active_input_box.top - 0.01)
-        pre_send_bubbles = extract_outgoing_bubbles(post_obs.image_bytes, post_ocr, chat_area=post_chat_area)
-        if has_new_outgoing_bubble(baseline_bubbles, pre_send_bubbles, clean_text):
-            return report(
-                SendStatus.ABORTED_PASTE_VERIFY,
-                "Unexpected outgoing bubble appeared during paste before Send was clicked",
-                paste_receipt=redacted_receipt,
-            )
-        steps.append("post_paste_verified")
-
-        # 9. Default --dry-run stops cleanly before Send
-        if dry_run:
-            return report(
-                SendStatus.DRY_RUN_READY,
-                "Dry-run completed: pasted text verified intact in input box; stopped before Send.",
-                paste_receipt=redacted_receipt,
-            )
-
-        # 10. Explicit --send path: locate dynamic blue Send button avoiding Space bar
-        require_blue_send = self.config.send_method == "enter"
-        send_loc = locate_blue_send_button(
-            post_obs.image_bytes,
-            post_ocr,
-            require_blue=require_blue_send,
-        )
-        if send_loc is None:
-            return report(
-                SendStatus.ABORTED_SEND_BUTTON,
-                "Could not uniquely locate lower-right blue Send button on keyboard",
-                paste_receipt=redacted_receipt,
-            )
-        send_box, send_label = send_loc
-        evidence.log_event(
-            "blue_send_button_located",
-            {"label": send_label, "send_box": send_box.as_list(), "send_method": self.config.send_method},
-        )
 
         # 11. Reserve send slot right before send dispatch (30s TTL)
         try:
@@ -455,6 +491,8 @@ class SendMessageWorkflow:
                 fresh_input,
                 clean_text,
                 allow_upward_growth=(focused_now is None),
+                before_image_bytes=pre_paste_image_bytes,
+                trusted_paste_evidence=trusted_paste_evidence,
             )
             if not ok_text:
                 raise SendPreconditionError(
@@ -516,6 +554,17 @@ class SendMessageWorkflow:
                         paste_receipt=redacted_receipt,
                     )
 
+                if streamlined_enter_send and "post_paste_verified" not in steps:
+                    steps.append("post_paste_verified")
+                    evidence.log_event(
+                        "blue_send_button_located",
+                        {
+                            "label": fresh_label,
+                            "send_box": fresh_box.as_list(),
+                            "send_method": self.config.send_method,
+                            "streamlined": True,
+                        },
+                    )
                 evidence.log_event(
                     "pre_enter_verified",
                     {
@@ -524,6 +573,7 @@ class SendMessageWorkflow:
                         "send_label": fresh_label,
                         "send_box": fresh_box.as_list(),
                         "caret_scope": fresh_input.as_list(),
+                        "streamlined": streamlined_enter_send,
                     },
                 )
                 try:
@@ -564,14 +614,25 @@ class SendMessageWorkflow:
                         "attempt": attempt,
                         "command_acknowledged": key_res.command_acknowledged,
                         "action_may_have_executed": key_res.action_may_have_executed,
+                        "error": key_res.error,
                         "caret_scope": fresh_input.as_list(),
                     },
                 )
                 if not key_res.command_acknowledged:
+                    if _is_safe_pre_hid_enter_result(key_res) and (attempt + 1 < max_enter_attempts):
+                        evidence.log_event(
+                            "send_enter_pre_hid_retry",
+                            {
+                                "attempt": attempt,
+                                "error": key_res.error,
+                                "action_may_have_executed": key_res.action_may_have_executed,
+                            },
+                        )
+                        continue
                     return report(
                         SendStatus.SEND_UNCONFIRMED,
                         "Protected Enter send was not acknowledged by driver "
-                        f"(action_may_have_executed={key_res.action_may_have_executed}); "
+                        f"(action_may_have_executed={key_res.action_may_have_executed}, error={key_res.error!r}); "
                         "refusing to settle as sent or retry.",
                         paste_receipt=redacted_receipt,
                     )
@@ -580,6 +641,7 @@ class SendMessageWorkflow:
                 break
         else:
             # 12 (click): Pre-send pointer move ONLY (allows HTTP 409 caret-blink retry, NEVER clicks)
+            assert post_obs is not None and send_box is not None
             evidence.log_event("pre_send_caret_scope", {"caret_scope": active_input_box.as_list()})
             try:
                 mp, _ = click_chain.pre_send_point_with_caret_retry(

@@ -752,6 +752,148 @@ def classify_bubble_role(
     return MessageRole.UNKNOWN
 
 
+def _has_continuous_horizontal_bridge(
+    rgb: np.ndarray,
+    left_box: Box,
+    right_box: Box,
+    canvas_lum: float,
+) -> bool:
+    """Return True when the horizontal gap between same-row boxes stays inside a bubble fill."""
+    if right_box.left <= left_box.right:
+        return True
+    h, w, _ = rgb.shape
+    x0 = max(0, min(w - 1, int(round(left_box.right * w))))
+    x1 = max(x0, min(w, int(round(right_box.left * w))))
+    y_top = max(left_box.top, right_box.top)
+    y_bot = min(left_box.bottom, right_box.bottom)
+    if y_bot <= y_top:
+        y_top = min(left_box.top, right_box.top)
+        y_bot = max(left_box.bottom, right_box.bottom)
+    y0 = max(0, min(h - 1, int(round(y_top * h))))
+    y1 = max(y0 + 1, min(h, int(round(y_bot * h))))
+    if x1 <= x0 or y1 <= y0:
+        return True
+    patch = rgb[y0:y1, x0:x1].astype(np.int16)
+    if patch.size == 0:
+        return True
+    lum = patch.mean(axis=2)
+    sat = patch.max(axis=2) - patch.min(axis=2)
+    canvas_cols = ((np.abs(lum - canvas_lum) <= 5.0) & (sat <= 12)).mean(axis=0)
+    return bool(float(canvas_cols.max()) < 0.55)
+
+
+def _join_same_row_texts(fragments: list[OcrBox]) -> str:
+    """Concatenate left-to-right OCR fragments from a single visual row without inventing spaces."""
+    parts: list[str] = []
+    prev_frag: OcrBox | None = None
+    for frag in fragments:
+        text = frag.text.strip()
+        if not text:
+            continue
+        if prev_frag is not None and parts:
+            prev_text = parts[-1]
+            if (
+                prev_text[-1].isascii()
+                and prev_text[-1].isalnum()
+                and text[0].isascii()
+                and text[0].isalnum()
+                and frag.box.left - prev_frag.box.right > 0.004
+            ):
+                parts.append(" ")
+        parts.append(text)
+        prev_frag = frag
+    return "".join(parts)
+
+
+def _merge_same_row_boxes(
+    items: list[OcrBox],
+    *,
+    role: MessageRole,
+    self_is_green: dict[int, bool],
+    confirmed_senders: dict[int, str],
+    rgb: np.ndarray | None,
+    canvas_lum: float,
+) -> tuple[list[OcrBox], dict[int, bool], dict[int, str]]:
+    """Merge OCR fragments that sit on the same visual line inside the same bubble."""
+    if len(items) <= 1:
+        return list(items), dict(self_is_green), dict(confirmed_senders)
+
+    ordered = sorted(items, key=lambda b: (round(b.box.center[1], 4), round(b.box.left, 4)))
+    clusters: list[list[OcrBox]] = []
+    for item in ordered:
+        attached = False
+        for row in reversed(clusters):
+            if role == MessageRole.SELF and (
+                self_is_green.get(id(item), True) != self_is_green.get(id(row[0]), True)
+            ):
+                continue
+            row_top = min(b.box.top for b in row)
+            row_bottom = max(b.box.bottom for b in row)
+            row_cy = sum(b.box.center[1] for b in row) / len(row)
+            row_h = max(b.box.height for b in row)
+            v_overlap = min(item.box.bottom, row_bottom) - max(item.box.top, row_top)
+            min_h = max(1e-6, min(item.box.height, row_h))
+            if abs(item.box.center[1] - row_cy) > max(0.010, max(row_h, item.box.height) * 0.55):
+                continue
+            if v_overlap < 0.30 * min_h:
+                continue
+
+            row_left = min(b.box.left for b in row)
+            row_right = max(b.box.right for b in row)
+            hgap = max(item.box.left - row_right, row_left - item.box.right)
+            if hgap > 0.12:
+                continue
+            if rgb is not None and hgap > 0.002:
+                if item.box.left >= row_right:
+                    left_nb = max(row, key=lambda b: b.box.right)
+                    right_nb = item
+                else:
+                    left_nb = item
+                    right_nb = min(row, key=lambda b: b.box.left)
+                if not _has_continuous_horizontal_bridge(rgb, left_nb.box, right_nb.box, canvas_lum):
+                    continue
+            row.append(item)
+            attached = True
+            break
+        if not attached:
+            clusters.append([item])
+
+    merged_items: list[OcrBox] = []
+    merged_self_is_green: dict[int, bool] = {}
+    merged_senders: dict[int, str] = {}
+    for cluster in clusters:
+        if len(cluster) == 1:
+            only = cluster[0]
+            merged_items.append(only)
+            if id(only) in self_is_green:
+                merged_self_is_green[id(only)] = self_is_green[id(only)]
+            if id(only) in confirmed_senders:
+                merged_senders[id(only)] = confirmed_senders[id(only)]
+            continue
+
+        row_sorted = sorted(cluster, key=lambda b: (round(b.box.left, 4), round(b.box.center[1], 4)))
+        joined_text = _join_same_row_texts(row_sorted)
+        merged_box = Box.clamped(
+            min(b.box.left for b in row_sorted),
+            min(b.box.top for b in row_sorted),
+            max(b.box.right for b in row_sorted),
+            max(b.box.bottom for b in row_sorted),
+        )
+        merged = OcrBox(
+            text=joined_text,
+            box=merged_box,
+            confidence=min(b.confidence for b in row_sorted),
+        )
+        merged_items.append(merged)
+        if any(id(b) in self_is_green for b in row_sorted):
+            merged_self_is_green[id(merged)] = all(self_is_green.get(id(b), True) for b in row_sorted)
+        sender = next((confirmed_senders[id(b)] for b in row_sorted if id(b) in confirmed_senders), "")
+        if sender:
+            merged_senders[id(merged)] = sender
+
+    return merged_items, merged_self_is_green, merged_senders
+
+
 class ChatMessageExtractor:
     """Extracts structured group chat messages from screenshots + OCR detections."""
 
@@ -866,9 +1008,17 @@ class ChatMessageExtractor:
         incoming_items = [b for b in incoming_items if not _overlaps_clipped_group(b.box)]
 
         messages: list[ExtractedMessage] = []
-        for role, items in ((MessageRole.SELF, self_items), (MessageRole.INCOMING, incoming_items)):
-            if not items:
+        for role, raw_items in ((MessageRole.SELF, self_items), (MessageRole.INCOMING, incoming_items)):
+            if not raw_items:
                 continue
+            items, role_self_is_green, role_confirmed_senders = _merge_same_row_boxes(
+                raw_items,
+                role=role,
+                self_is_green=self_is_green,
+                confirmed_senders=confirmed_senders,
+                rgb=rgb,
+                canvas_lum=canvas_lum,
+            )
             items.sort(key=lambda b: (round(b.box.top, 3), round(b.box.left, 3)))
             groups: list[list[OcrBox]] = [[items[0]]]
             for item in items[1:]:
@@ -878,8 +1028,8 @@ class ChatMessageExtractor:
                     aligned = abs(item.box.left - prev.box.left) <= 0.09 or abs(item.box.right - prev.box.right) <= 0.12
                     same_group = -0.005 <= vgap <= 0.032 and aligned
                     if same_group and rgb is not None:
-                        prev_green = self_is_green.get(id(prev), True)
-                        curr_green = self_is_green.get(id(item), True)
+                        prev_green = role_self_is_green.get(id(prev), True)
+                        curr_green = role_self_is_green.get(id(item), True)
                         if prev_green != curr_green:
                             same_group = False
                         elif prev_green:
@@ -904,7 +1054,10 @@ class ChatMessageExtractor:
                 joined = "\n".join(b.text.strip() for b in grp if b.text.strip())
                 sender = ""
                 if role == MessageRole.INCOMING:
-                    sender = next((confirmed_senders[id(line)] for line in grp if id(line) in confirmed_senders), "")
+                    sender = next(
+                        (role_confirmed_senders[id(line)] for line in grp if id(line) in role_confirmed_senders),
+                        "",
+                    )
                     if not sender:
                         sender = _find_sender_label(combined_box, canvas_labels)
                 mentioned = role == MessageRole.INCOMING and mentions_any_alias(joined, self_aliases)

@@ -200,6 +200,14 @@ class PasteRecoveryState(str, Enum):
             return cls.UNKNOWN
 
 
+TRUSTED_PASTE_CONFIRMATION_EVIDENCE = frozenset(
+    {
+        "direct_paste_verified",
+        "paste_permission_dismissed",
+    }
+)
+
+
 @dataclass
 class PasteFlowResult:
     ok: bool
@@ -212,6 +220,8 @@ class PasteFlowResult:
     permission_sheet_seen: bool = False
     error: str = ""
     image_path: str | None = None
+    confirmation_evidence: str = ""
+    client_text_match: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -222,6 +232,21 @@ class PasteFlowResult:
             and self.phase == "completed"
             and self.effect_verified is True
             and self.recovery_state == PasteRecoveryState.COMPLETED
+        )
+
+    @property
+    def effective_confirmation_evidence(self) -> str:
+        if self.confirmation_evidence:
+            return self.confirmation_evidence
+        raw_ev = self.raw.get("confirmation_evidence")
+        return raw_ev if isinstance(raw_ev, str) else ""
+
+    @property
+    def has_trusted_confirmation_evidence(self) -> bool:
+        return (
+            self.is_strictly_completed
+            and self.raw.get("client_text_verified") is not False
+            and self.effective_confirmation_evidence in TRUSTED_PASTE_CONFIRMATION_EVIDENCE
         )
 
 

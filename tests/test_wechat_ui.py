@@ -669,5 +669,625 @@ def test_prepare_input_box_ocr_crop_masks_green_caret_and_fallback_recovers_shor
     assert verify_pasted_text_with_fallback(ocr_dup, img_bytes, truncated_full_boxes, pill, expected)[0] is False
 
 
+def _make_corner_fade_pair(
+    *,
+    w: int = 500,
+    h: int = 1080,
+    pill: Box | None = None,
+    row1_box: Box | None = None,
+    dark_tail: bool = False,
+    omit_cell: bool = False,
+    with_mic_icon: bool = True,
+) -> tuple[bytes, bytes]:
+    """Build synthetic empty-before & pasted-after images simulating lower-right corner fade above mic chrome."""
+    import io
+
+    from PIL import Image, ImageDraw
+
+    pill = pill or Box(0.132, 0.482, 0.764, 0.576)
+    row1_box = row1_box or Box(0.158, 0.514, 0.712, 0.542)
+
+    before_bytes = make_keyboard_chat_image(
+        w=w,
+        h=h,
+        blue_send=False,
+        with_caret=True,
+        with_right_mic_icon=False,
+        input_box=pill,
+    )
+    if with_mic_icon:
+        with Image.open(io.BytesIO(before_bytes)) as bimg:
+            brgb = bimg.convert("RGB")
+            bdraw = ImageDraw.Draw(brgb)
+            bdraw.rounded_rectangle(
+                [int(round(0.692 * w)), int(round(0.543 * h)), int(round(0.720 * w)), int(round(0.562 * h))],
+                radius=4,
+                fill=(77, 75, 78),
+            )
+            bbuf = io.BytesIO()
+            brgb.save(bbuf, format="PNG")
+            before_bytes = bbuf.getvalue()
+
+    after_base = make_keyboard_chat_image(
+        w=w,
+        h=h,
+        blue_send=True,
+        with_caret=True,
+        with_right_mic_icon=False,
+        input_box=pill,
+    )
+    with Image.open(io.BytesIO(after_base)) as img:
+        rgb = img.convert("RGB")
+        draw = ImageDraw.Draw(rgb)
+        if with_mic_icon:
+            draw.rounded_rectangle(
+                [int(round(0.692 * w)), int(round(0.543 * h)), int(round(0.720 * w)), int(round(0.562 * h))],
+                radius=4,
+                fill=(77, 75, 78),
+            )
+        x0 = int(round(row1_box.left * w))
+        y0 = int(round(row1_box.top * h))
+        x1 = int(round(row1_box.right * w))
+        y1 = int(round(row1_box.bottom * h))
+        mid_y = (y0 + y1) // 2
+        cw = max(14, round((x1 - x0) / 11)) if omit_cell else max(14, round((x1 - x0) / 12))
+
+        if omit_cell:
+            draw.rectangle([x0 + 4, y0 + 3, max(x0 + 10, x1 - 4), y1 - 3], fill=(12, 12, 12))
+            fade_x0 = x1 + 2
+            fade_x1 = min(int(round(pill.right * w)) - 2, x1 + cw)
+            draw.rectangle([fade_x0, y0 + 2, fade_x1, mid_y], fill=(90, 90, 90))
+            bot_fill = (12, 12, 12) if dark_tail else (175, 175, 175)
+            draw.rectangle([fade_x0, mid_y, fade_x1, y1 - 2], fill=bot_fill)
+        else:
+            draw.rectangle([x0 + 4, y0 + 3, max(x0 + 10, x1 - cw - 4), y1 - 3], fill=(12, 12, 12))
+            draw.rectangle([max(x0, x1 - cw), y0 + 2, x1, mid_y], fill=(80, 80, 80))
+            bot_fill = (12, 12, 12) if dark_tail else (180, 180, 180)
+            draw.rectangle([max(x0, x1 - cw), mid_y, x1, y1 - 2], fill=bot_fill)
+
+        buf = io.BytesIO()
+        rgb.save(buf, format="PNG")
+        return before_bytes, buf.getvalue()
+
+
+def test_stationary_corner_icon_filtered_only_when_pixel_stationary_and_not_expected_tail() -> None:
+    import io
+
+    from PIL import Image, ImageDraw
+
+    pill = Box(0.132, 0.528, 0.764, 0.576)
+    before_bytes = make_keyboard_chat_image(
+        w=500,
+        h=1080,
+        blue_send=False,
+        with_caret=True,
+        with_right_mic_icon=True,
+        input_box=pill,
+    )
+    after_bytes = make_keyboard_chat_image(
+        w=500,
+        h=1080,
+        blue_send=True,
+        with_caret=True,
+        with_right_mic_icon=True,
+        input_box=pill,
+    )
+
+    boxes = [
+        OcrBox("你好，帮我查下这个链接", Box(0.158, 0.538, 0.620, 0.564)),
+        OcrBox("0", Box(0.688, 0.542, 0.722, 0.560)),
+    ]
+    # 1. Untrusted mode MUST NOT drop the '0' corner token
+    ok_untrusted, obs_untrusted = verify_pasted_text(
+        boxes,
+        pill,
+        "你好，帮我查下这个链接",
+        image_bytes=after_bytes,
+        before_image_bytes=before_bytes,
+        trusted_paste_evidence=False,
+    )
+    assert ok_untrusted is False
+    assert obs_untrusted.endswith("0")
+
+    # 2. Trusted evidence + stationary pixel-identical mic chrome -> drops '0' and passes
+    ok_trusted, obs_trusted = verify_pasted_text(
+        boxes,
+        pill,
+        "你好，帮我查下这个链接",
+        image_bytes=after_bytes,
+        before_image_bytes=before_bytes,
+        trusted_paste_evidence=True,
+    )
+    assert ok_trusted is True
+    assert obs_trusted == "你好，帮我查下这个链接"
+
+    # 3. Never drop a real trailing '0' when expected text ends with '0'
+    ok_real_zero, _ = verify_pasted_text(
+        boxes,
+        pill,
+        "你好，帮我查下这个链接0",
+        image_bytes=after_bytes,
+        before_image_bytes=before_bytes,
+        trusted_paste_evidence=True,
+    )
+    assert ok_real_zero is True
+
+    ok_dup_zero, _ = verify_pasted_text(
+        [
+            OcrBox("价格是10", Box(0.158, 0.538, 0.420, 0.564)),
+            OcrBox("0", Box(0.688, 0.542, 0.722, 0.560)),
+        ],
+        pill,
+        "价格是10",
+        image_bytes=after_bytes,
+        before_image_bytes=before_bytes,
+        trusted_paste_evidence=True,
+    )
+    assert ok_dup_zero is False
+
+    # 4. When corner pixels actually changed vs before_bytes, MUST NOT drop token even if tiny
+    with Image.open(io.BytesIO(after_bytes)) as img:
+        rgb = img.convert("RGB")
+        draw = ImageDraw.Draw(rgb)
+        draw.rectangle([344, 585, 361, 605], fill=(5, 210, 5))
+        buf = io.BytesIO()
+        rgb.save(buf, format="PNG")
+        changed_after = buf.getvalue()
+
+    ok_changed, _ = verify_pasted_text(
+        boxes,
+        pill,
+        "你好，帮我查下这个链接",
+        image_bytes=changed_after,
+        before_image_bytes=before_bytes,
+        trusted_paste_evidence=True,
+    )
+    assert ok_changed is False
+
+
+def test_corner_fade_substitution_and_omission_compatibility_with_strict_security_guards() -> None:
+    from tests.fakes import MockOcrEngine
+
+    pill = Box(0.132, 0.482, 0.764, 0.576)
+    expected = "这个得赶紧找群主确认，没发货前一般还能协调改，具体看订单状态。"
+
+    before_sub, after_sub = _make_corner_fade_pair(pill=pill, omit_cell=False, dark_tail=False)
+    sub_boxes = [
+        OcrBox("这个得赶紧找群主确认，没", Box(0.158, 0.492, 0.712, 0.515)),
+        OcrBox("发货前一般还能协调改，目", Box(0.158, 0.514, 0.712, 0.542)),
+        OcrBox("体看订单状态。", Box(0.158, 0.542, 0.460, 0.565)),
+        OcrBox("0", Box(0.688, 0.542, 0.722, 0.560)),
+    ]
+
+    # 1. Exact corner-fade sub ('具'->'目') + stationary '0' passes ONLY when trusted evidence + before image exist
+    assert (
+        verify_pasted_text(
+            sub_boxes,
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is True
+    )
+    assert (
+        verify_pasted_text(
+            sub_boxes,
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=False,
+        )[0]
+        is False
+    )
+    assert (
+        verify_pasted_text(
+            sub_boxes,
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=None,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+    assert (
+        verify_pasted_text(
+            sub_boxes,
+            pill,
+            expected,
+            allow_upward_growth=True,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+    # 2. Crop fallback omit path ('具' dropped in 2x crop) passes when physical omit fade cell is verified
+    before_omit, after_omit = _make_corner_fade_pair(
+        pill=pill,
+        row1_box=Box(0.158, 0.514, 0.635, 0.542),
+        omit_cell=True,
+        dark_tail=False,
+    )
+    prepared = prepare_input_box_ocr_crop(after_omit, pill, allow_upward_growth=False)
+    assert prepared is not None
+    crop_bytes, _ = prepared
+    ocr = MockOcrEngine()
+    # Register full-frame missing-tail OCR (unacceptable alone) and crop OCR missing '具' cleanly
+    full_bad_boxes = [
+        OcrBox("这个得赶紧找群主确认，没", Box(0.158, 0.492, 0.712, 0.515)),
+        OcrBox("发货前一般还能协调改，目", Box(0.158, 0.514, 0.712, 0.542)),
+        OcrBox("体看订单状", Box(0.158, 0.542, 0.440, 0.565)),  # triggers fallback via wrong extra diff
+    ]
+    ocr.register(
+        crop_bytes,
+        [
+            OcrBox("这个得赶紧找群主确认，没", Box(0.06, 0.12, 0.88, 0.36)),
+            OcrBox("发货前一般还能协调改，", Box(0.06, 0.382, 0.785, 0.607)),
+            OcrBox("体看订单状态。", Box(0.06, 0.63, 0.50, 0.86)),
+        ],
+    )
+    ok_omit, obs_omit = verify_pasted_text_with_fallback(
+        ocr,
+        after_omit,
+        full_bad_boxes,
+        pill,
+        expected,
+        before_image_bytes=before_omit,
+        trusted_paste_evidence=True,
+    )
+    assert ok_omit is True
+    assert "体看订单状态。" in obs_omit
+
+    # 3. Non-faded dark tail MUST be rejected even with trusted evidence
+    before_dark, after_dark = _make_corner_fade_pair(pill=pill, omit_cell=False, dark_tail=True)
+    assert (
+        verify_pasted_text(
+            sub_boxes,
+            pill,
+            expected,
+            image_bytes=after_dark,
+            before_image_bytes=before_dark,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+    # 4. Strict safety rejections even with trusted evidence and physical corner fade:
+    # 4a. Diff on non-faded row (row 0)
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("这个得赶紧找群主确认，行", Box(0.158, 0.492, 0.712, 0.515)),
+                OcrBox("发货前一般还能协调改，具", Box(0.158, 0.514, 0.712, 0.542)),
+                OcrBox("体看订单状态。", Box(0.158, 0.542, 0.460, 0.565)),
+            ],
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+    # 4b. Non-trailing char diff on faded row
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("这个得赶紧找群主确认，没", Box(0.158, 0.492, 0.712, 0.515)),
+                OcrBox("发货前一般还能协改改，具", Box(0.158, 0.514, 0.712, 0.542)),
+                OcrBox("体看订单状态。", Box(0.158, 0.542, 0.460, 0.565)),
+            ],
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+    # 4c. 2-char diff on faded row
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("这个得赶紧找群主确认，没", Box(0.158, 0.492, 0.712, 0.515)),
+                OcrBox("发货前一般还能协调的，目", Box(0.158, 0.514, 0.712, 0.542)),
+                OcrBox("体看订单状态。", Box(0.158, 0.542, 0.460, 0.565)),
+            ],
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+    # 4d. High-risk payloads (digits / prices / percent / URLs / emails) -> NEVER tolerate
+    high_risk_cases = [
+        (
+            "请核对订单金额共199元后再",
+            "发货前一般还能协调改，具",
+            "请核对订单金额共199元后再发货前一般还能协调改，具体看订单状态。",
+            "发货前一般还能协调改，目",
+        ),
+        (
+            "这期优惠价只需¥50即可锁",
+            "发货前一般还能协调改，具",
+            "这期优惠价只需¥50即可锁发货前一般还能协调改，具体看订单状态。",
+            "发货前一般还能协调改，目",
+        ),
+        (
+            "活动限时折扣低至10%起售",
+            "发货前一般还能协调改，具",
+            "活动限时折扣低至10%起售发货前一般还能协调改，具体看订单状态。",
+            "发货前一般还能协调改，目",
+        ),
+        (
+            "https://example.com请点这",
+            "发货前一般还能协调改，具",
+            "https://example.com请点这发货前一般还能协调改，具体看订单状态。",
+            "发货前一般还能协调改，目",
+        ),
+        (
+            "客服邮箱a@b.cn联系处理好",
+            "发货前一般还能协调改，具",
+            "客服邮箱a@b.cn联系处理好发货前一般还能协调改，具体看订单状态。",
+            "发货前一般还能协调改，目",
+        ),
+    ]
+    for r0, _r1, risk_exp, r1_sub in high_risk_cases:
+        assert (
+            verify_pasted_text(
+                [
+                    OcrBox(r0, Box(0.158, 0.492, 0.712, 0.515)),
+                    OcrBox(r1_sub, Box(0.158, 0.514, 0.712, 0.542)),
+                    OcrBox("体看订单状态。", Box(0.158, 0.542, 0.460, 0.565)),
+                ],
+                pill,
+                risk_exp,
+                image_bytes=after_sub,
+                before_image_bytes=before_sub,
+                trusted_paste_evidence=True,
+            )[0]
+            is False
+        )
+
+    # 4e. Protected negation/payment/refund CJK chars at the fade site MUST fail
+    for protected_ch in ("不", "没", "别", "无", "退", "款", "付"):
+        neg_exp = f"请先找群主核对一下订单情况发货前{protected_ch}可以协调修改地址。"
+        assert (
+            verify_pasted_text(
+                [
+                    OcrBox("请先找群主核对一下订单情况", Box(0.158, 0.492, 0.712, 0.515)),
+                    OcrBox("发货前白", Box(0.158, 0.514, 0.712, 0.542)),
+                    OcrBox("可以协调修改地址。", Box(0.158, 0.542, 0.460, 0.565)),
+                ],
+                pill,
+                neg_exp,
+                image_bytes=after_sub,
+                before_image_bytes=before_sub,
+                trusted_paste_evidence=True,
+            )[0]
+            is False
+        )
+
+    # 4f. Short payload (< 15 chars) & hard newline loss MUST fail
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("请找群主确认", Box(0.158, 0.492, 0.500, 0.515)),
+                OcrBox("协调改，目", Box(0.158, 0.514, 0.712, 0.542)),
+            ],
+            pill,
+            "请找群主确认协调改，具",
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("这个得赶紧找群主确认，没", Box(0.158, 0.492, 0.712, 0.515)),
+                OcrBox("发货前一般还能协调改，目体看订单状态。", Box(0.158, 0.514, 0.712, 0.542)),
+            ],
+            pill,
+            "这个得赶紧找群主确认，没发货前一般还能协调改，具\n体看订单状态。",
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+
+def test_corner_fade_combined_with_bounded_thin_punctuation_omission() -> None:
+    pill = Box(0.130, 0.456, 0.764, 0.576)
+    expected = "在群里的官方团购小程序进「订单详情」就能看到物流单号；找不到的话联系群主帮你看下。"
+    before_sub, after_sub = _make_corner_fade_pair(
+        pill=pill,
+        row1_box=Box(0.158, 0.514, 0.716, 0.540),
+        omit_cell=False,
+        dark_tail=False,
+    )
+    sub_and_punct_boxes = [
+        OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+        OcrBox("「订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+        OcrBox("号；找不到的话联系群主都", Box(0.158, 0.514, 0.716, 0.540)),
+        OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+        OcrBox("U", Box(0.688, 0.542, 0.722, 0.560)),
+    ]
+
+    # Combined faded sub ('帮'->'都') + dropped thin bracket '」' passes ONLY with trusted evidence + physical fade
+    assert (
+        verify_pasted_text(
+            sub_and_punct_boxes,
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is True
+    )
+    assert (
+        verify_pasted_text(
+            sub_and_punct_boxes,
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=False,
+        )[0]
+        is False
+    )
+    _, after_dark = _make_corner_fade_pair(
+        pill=pill,
+        row1_box=Box(0.158, 0.514, 0.716, 0.540),
+        omit_cell=False,
+        dark_tail=True,
+    )
+    assert (
+        verify_pasted_text(
+            sub_and_punct_boxes,
+            pill,
+            expected,
+            image_bytes=after_dark,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+    # Combined faded omit ('帮'->'') + dropped '」' passes with physical omit fade cell
+    before_omit, after_omit = _make_corner_fade_pair(
+        pill=pill,
+        row1_box=Box(0.158, 0.514, 0.635, 0.540),
+        omit_cell=True,
+        dark_tail=False,
+    )
+    omit_and_punct_boxes = [
+        OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+        OcrBox("「订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+        OcrBox("号；找不到的话联系群主", Box(0.158, 0.514, 0.635, 0.540)),
+        OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+    ]
+    assert (
+        verify_pasted_text(
+            omit_and_punct_boxes,
+            pill,
+            expected,
+            image_bytes=after_omit,
+            before_image_bytes=before_omit,
+            trusted_paste_evidence=True,
+        )[0]
+        is True
+    )
+
+    # Negative 1: dropping a real CJK char ('情') alongside corner fade MUST fail
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+                OcrBox("「订单详就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+                OcrBox("号；找不到的话联系群主都", Box(0.158, 0.514, 0.716, 0.540)),
+                OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+            ],
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+    # Negative 2: dropping 3 thin punctuations ('「', '」', '；') alongside corner fade MUST fail
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+                OcrBox("订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+                OcrBox("号找不到的话联系群主都", Box(0.158, 0.514, 0.716, 0.540)),
+                OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+            ],
+            pill,
+            expected,
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+    # Negative 3: high-risk digit payload or protected negation/refund CJK alongside dropped '」' + fade MUST fail
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("订单实付199元请核对清楚", Box(0.160, 0.468, 0.711, 0.487)),
+                OcrBox("「订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+                OcrBox("号；找不到的话联系群主都", Box(0.158, 0.514, 0.716, 0.540)),
+                OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+            ],
+            pill,
+            "订单实付199元请核对清楚「订单详情」就能看到物流单号；找不到的话联系群主帮你看下。",
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+                OcrBox("「订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+                OcrBox("号；找不到的话先别自己都", Box(0.158, 0.514, 0.716, 0.540)),
+                OcrBox("你看下。", Box(0.154, 0.540, 0.325, 0.566)),
+            ],
+            pill,
+            "在群里的官方团购小程序进「订单详情」就能看到物流单号；找不到的话先别自己退你看下。",
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+    # Negative 4: collapsed hard newline across two logical lines alongside dropped '」' + fade MUST fail
+    assert (
+        verify_pasted_text(
+            sub_and_punct_boxes,
+            pill,
+            "在群里的官方团购小程序进「订单详情」就能看到物流单号；找不到的话联系群主帮\n你看下。",
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is True
+    )
+    assert (
+        verify_pasted_text(
+            [
+                OcrBox("在群里的官方团购小程序进", Box(0.160, 0.468, 0.711, 0.487)),
+                OcrBox("「订单详情就能看到物流单", Box(0.168, 0.491, 0.733, 0.514)),
+                OcrBox("号；找不到的话联系群主都你看下。", Box(0.158, 0.514, 0.716, 0.540)),
+            ],
+            pill,
+            "在群里的官方团购小程序进「订单详情」就能看到物流单号；找不到的话联系群主帮\n你看下。",
+            image_bytes=after_sub,
+            before_image_bytes=before_sub,
+            trusted_paste_evidence=True,
+        )[0]
+        is False
+    )
+
+
+
 
 

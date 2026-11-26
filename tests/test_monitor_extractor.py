@@ -667,3 +667,66 @@ def test_viewport_alignment_recovers_middle_occlusion_and_blocks_ambiguous_k1_du
         ),
     ]
     assert align_viewport_suffix(prev, curr_scroll) == ViewportAlignment("scroll_up", 2, 2)
+
+
+def test_extractor_merges_same_row_horizontally_split_self_and_incoming_bubbles() -> None:
+    self_b1 = Box(0.252, 0.155, 0.835, 0.275)
+    self_b2 = Box(0.450, 0.295, 0.835, 0.340)
+    inc_b1 = Box(0.165, 0.405, 0.680, 0.455)
+    base_img = make_collapsed_chat_image(
+        outgoing_boxes=[self_b1, self_b2],
+        incoming_boxes=[inc_b1],
+    )
+    with Image.open(io.BytesIO(base_img)) as im:
+        rgb = im.convert("RGB")
+        w, h = rgb.size
+        draw = ImageDraw.Draw(rgb)
+        # Simulate dark glyph strokes inside the "@良策AI" box so the left half is real bubble text
+        draw.rectangle(
+            [int(round(0.205 * w)), int(round(0.420 * h)), int(round(0.355 * w)), int(round(0.436 * h))],
+            fill=(25, 25, 25),
+        )
+        buf = io.BytesIO()
+        rgb.save(buf, format="PNG")
+        img = buf.getvalue()
+
+    ocr = [
+        OcrBox("示例分享·测试3群(198)(12)", Box(0.14, 0.069, 0.846, 0.094)),
+        # Line 1 of self bubble split horizontally with slight y jitter ('般...' top=0.168, '一' top=0.172)
+        OcrBox("般发货时效看商品页说明", Box(0.312, 0.168, 0.810, 0.193)),
+        OcrBox("一", Box(0.270, 0.172, 0.308, 0.197)),
+        OcrBox("你在群内官方团购链接或小程", Box(0.270, 0.196, 0.810, 0.219)),
+        OcrBox("序里能看到具体发货时间，急", Box(0.270, 0.222, 0.810, 0.245)),
+        OcrBox("的话联系群主确认下。", Box(0.270, 0.248, 0.620, 0.271)),
+        # Second independent stacked green bubble separated by grey canvas
+        OcrBox("hello", Box(0.470, 0.304, 0.610, 0.329)),
+        OcrBox("world", Box(0.628, 0.304, 0.780, 0.329)),
+        # Incoming white bubble with same-row split prefix + sender above
+        OcrBox("Lee.", Box(0.170, 0.370, 0.240, 0.388)),
+        OcrBox("@良策AI", Box(0.200, 0.415, 0.360, 0.440)),
+        OcrBox("一般几天发货？", Box(0.368, 0.417, 0.655, 0.442)),
+    ]
+
+    extractor = ChatMessageExtractor()
+    msgs = extractor.extract(
+        img,
+        ocr,
+        group_title="示例分享·测试3群(198)",
+        self_aliases=("良策AI",),
+        captured_at=1200.0,
+    )
+
+    assert len(msgs) == 3
+    assert msgs[0].role == MessageRole.SELF
+    assert msgs[0].text == (
+        "一般发货时效看商品页说明\n"
+        "你在群内官方团购链接或小程\n"
+        "序里能看到具体发货时间，急\n"
+        "的话联系群主确认下。"
+    )
+    assert msgs[1].role == MessageRole.SELF
+    assert msgs[1].text == "hello world"
+    assert msgs[2].role == MessageRole.INCOMING
+    assert msgs[2].sender == "Lee."
+    assert msgs[2].text == "@良策AI一般几天发货？"
+    assert msgs[2].mentioned_self is True
