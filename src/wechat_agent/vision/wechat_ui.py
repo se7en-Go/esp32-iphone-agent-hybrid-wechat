@@ -23,11 +23,11 @@ from .geometry import (
 )
 from .ocr import OcrEngine, OcrError
 
-SEND_LABELS = ("发送", "發送", "Send")
+SEND_LABELS = ("发送", "發送", "Send", "send")
 SEND_SEARCH_REGION = Box(0.65, 0.50, 1.0, 0.96)
 SPACE_LABELS = ("空格", "space", "Space")
 WECHAT_TAB_LABELS = {"微信", "通讯录", "发现", "我"}
-KEYBOARD_CUE_TOKENS = {"发送", "發送", "Send", "空格", "space", "Space", "换行", "return", "拼音", "选词"}
+KEYBOARD_CUE_TOKENS = {"发送", "發送", "Send", "send", "空格", "space", "Space", "换行", "return", "拼音", "选词"}
 
 
 class ScreenKind(str, Enum):
@@ -69,6 +69,13 @@ def _image_aspect(image_bytes: bytes, default: float = 0.463) -> float:
     return default
 
 
+def is_compact_portrait_image(image_bytes: bytes) -> bool:
+    """True for classic 9:16 Touch ID portrait iPhones (aspect ~0.563, thin top status bar, no Home Indicator)."""
+    if not image_bytes:
+        return False
+    return 0.52 <= _image_aspect(image_bytes) <= 0.62
+
+
 def _norm_box_to_pixels(box: Box, width: int, height: int) -> tuple[int, int, int, int]:
     x0 = max(0, min(width - 1, int(round(box.left * width))))
     y0 = max(0, min(height - 1, int(round(box.top * height))))
@@ -101,13 +108,12 @@ _HEADER_TIMESTAMP_RE = re.compile(
 def _header_title_candidates(ocr_boxes: list[OcrBox]) -> list[OcrBox]:
     """Return non-empty OCR boxes inside the WeChat iOS top navigation title slot.
 
-    Restricts `bottom <= 0.110` (above the chat viewport's top edge) and excludes pure
-    system timestamps so chat-viewport timestamps like `16:18` at `y ≈ 0.114..0.133` never
-    pollute navigation title detection.
+    Accepts `top >= 0.036` so both Face ID (`top >= 0.065`) and 9:16 Touch ID (`top ~ 0.041`)
+    headers match while still excluding status bars (`top <= 0.025`) and banners above the bar.
     """
     out: list[OcrBox] = []
     for b in ocr_boxes:
-        if not (0.045 <= b.box.top and b.box.bottom <= 0.110 and 0.14 <= b.box.center[0] <= 0.86):
+        if not (0.036 <= b.box.top and b.box.bottom <= 0.110 and 0.14 <= b.box.center[0] <= 0.86):
             continue
         norm = normalize_text(b.text)
         if not norm or _HEADER_TIMESTAMP_RE.match(norm):
@@ -417,13 +423,17 @@ def _extract_input_pill_box(rgb: np.ndarray, scan_box: Box) -> Box | None:
 
 
 def locate_collapsed_input_box(image_bytes: bytes, ocr_boxes: list[OcrBox] | None = None) -> Box:
-    """Locate the collapsed bottom input field pill, strictly clamped above y > 0.95 Home Indicator."""
+    """Locate the collapsed bottom input field pill, avoiding the Home Indicator only when present."""
     rgb = _decode_rgb(image_bytes)
+    compact = is_compact_portrait_image(image_bytes)
     if rgb is not None:
-        pill = _extract_input_pill_box(rgb, Box(0.10, 0.855, 0.82, HOME_INDICATOR_MAX_SAFE_Y))
+        max_y = 0.992 if compact else HOME_INDICATOR_MAX_SAFE_Y
+        pill = _extract_input_pill_box(rgb, Box(0.10, 0.855, 0.82, max_y))
         if pill is not None:
-            return clamp_avoiding_home_indicator(pill)
+            return pill if compact else clamp_avoiding_home_indicator(pill)
 
+    if compact:
+        return Box(0.16, 0.915, 0.76, 0.985)
     # Safe fallback box avoiding y > 0.95 system indicator bar.
     return clamp_avoiding_home_indicator(Box(0.16, 0.885, 0.76, 0.942))
 
@@ -1134,11 +1144,15 @@ def locate_blue_send_button(
     button pixels around the matched Send label rather than falling back to OCR-only bounds.
     Returns `(button_box, matched_label)` or `None`.
     """
+    compact = is_compact_portrait_image(image_bytes)
+    search_region = Box(0.65, 0.50, 1.0, 0.995) if compact else SEND_SEARCH_REGION
+    max_blue_bottom = 0.995 if compact else 0.955
+    max_fallback_bottom = 0.995 if compact else 0.95
     matches = [
         b
         for b in ocr_boxes
         if normalize_text(b.text) in SEND_LABELS
-        and SEND_SEARCH_REGION.contains(*b.box.center)
+        and search_region.contains(*b.box.center)
     ]
     if len(matches) != 1:
         return None
@@ -1158,7 +1172,7 @@ def locate_blue_send_button(
             max(min_safe_left, blue_box.left),
             blue_box.top,
             min(0.995, blue_box.right),
-            min(0.955, blue_box.bottom),
+            min(max_blue_bottom, blue_box.bottom),
         )
     elif require_blue:
         return None
@@ -1168,7 +1182,7 @@ def locate_blue_send_button(
             max(min_safe_left, label_item.box.left - 0.035),
             max(0.55, label_item.box.top - 0.018),
             min(0.99, label_item.box.right + 0.035),
-            min(0.95, label_item.box.bottom + 0.018),
+            min(max_fallback_bottom, label_item.box.bottom + 0.018),
         )
     return button_box, matched_label
 

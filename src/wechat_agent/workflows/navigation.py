@@ -248,7 +248,7 @@ class WeChatNavigator:
 
                 if kind == ScreenKind.OTHER_CHAT and back_attempts < 1:
                     back_attempts += 1
-                    back_box = Box(0.02, 0.045, 0.13, 0.115)
+                    back_box = Box(0.02, 0.038, 0.13, 0.115)
                     click_res = self.click_chain.point_and_click(
                         obs.screen_id,
                         back_box.center,
