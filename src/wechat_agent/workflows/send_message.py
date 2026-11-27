@@ -26,6 +26,7 @@ from wechat_agent.vision.wechat_ui import (
     extract_outgoing_bubbles,
     has_exact_chat_title,
     has_new_outgoing_bubble,
+    is_compact_portrait_image,
     locate_blue_send_button,
     locate_collapsed_input_box,
     verify_pasted_text_with_fallback,
@@ -196,7 +197,10 @@ class SendMessageWorkflow:
             click_res = None
             for attempt in range(3):
                 collapsed_box = locate_collapsed_input_box(obs.image_bytes, ocr_boxes)
-                aim_xy = left_biased_input_aim(collapsed_box)
+                aim_xy = left_biased_input_aim(
+                    collapsed_box,
+                    avoid_home_indicator=not is_compact_portrait_image(obs.image_bytes),
+                )
                 evidence.log_event(
                     "focus_collapsed_input",
                     {"attempt": attempt, "collapsed_box": collapsed_box.as_list(), "aim_xy": list(aim_xy)},

@@ -1288,6 +1288,73 @@ def test_corner_fade_combined_with_bounded_thin_punctuation_omission() -> None:
     )
 
 
+def test_compact_portrait_header_collapsed_input_and_lowercase_send_button() -> None:
+    """9:16 Touch ID phones (608x1080) have higher nav titles and no bottom Home Indicator."""
+    from PIL import Image, ImageDraw
+
+    from tests.fakes import _encode_png
+
+    w, h = 608, 1080
+    # 1. Header title at top=0.041 must resolve TARGET_CHAT, while top<=0.025 status bar stays excluded.
+    compact_boxes = [
+        OcrBox("15:41", Box(0.457, 0.005, 0.543, 0.024)),
+        OcrBox("文件传输助手", Box(0.354, 0.041, 0.648, 0.072)),
+    ]
+    assert has_exact_chat_title(compact_boxes, "文件传输助手") is True
+    assert detect_screen_context(compact_boxes, "文件传输助手") == ScreenKind.TARGET_CHAT
+
+    status_only_noise = [
+        OcrBox("文件传输助手", Box(0.354, 0.012, 0.648, 0.030)),
+        OcrBox("群聊B", Box(0.380, 0.041, 0.620, 0.072)),
+    ]
+    assert has_exact_chat_title(status_only_noise, "文件传输助手") is False
+
+    # 2. Collapsed pill below y=0.95 stays un-clamped on 608x1080 and aim stays inside the pill.
+    img = Image.new("RGB", (w, h), (237, 237, 237))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, int(0.905 * h), w, h], fill=(245, 245, 245))
+    draw.rounded_rectangle(
+        (round(0.118 * w), round(0.922 * h), round(0.786 * w), round(0.985 * h)),
+        radius=8,
+        fill=(255, 255, 255),
+    )
+    compact_img = _encode_png(img)
+    pill = locate_collapsed_input_box(compact_img)
+    assert pill.bottom > 0.96
+    aim_x, aim_y = left_biased_input_aim(pill, avoid_home_indicator=False)
+    assert 0.94 <= aim_y <= 0.985
+    assert pill.contains(aim_x, aim_y)
+
+    # Face ID phone remains strictly clamped <= 0.948.
+    face_id_img = make_collapsed_chat_image()
+    face_pill = locate_collapsed_input_box(face_id_img)
+    assert face_pill.bottom <= 0.948
+
+    # 3. Lowercase 'send' button at y=0.950..0.978 on 608x1080 is detected with require_blue=True.
+    kb_img = Image.new("RGB", (w, h), (237, 237, 237))
+    kb_draw = ImageDraw.Draw(kb_img)
+    kb_draw.rectangle([0, int(0.635 * h), w, h], fill=(209, 212, 217))
+    kb_draw.rounded_rectangle(
+        (round(0.745 * w), round(0.935 * h), round(0.990 * w), round(0.988 * h)),
+        radius=8,
+        fill=(0, 122, 255),
+    )
+    compact_kb = _encode_png(kb_img)
+    send_box_res = locate_blue_send_button(
+        compact_kb,
+        [
+            OcrBox("space", Box(0.493, 0.952, 0.610, 0.978)),
+            OcrBox("send", Box(0.826, 0.950, 0.923, 0.978)),
+        ],
+        require_blue=True,
+    )
+    assert send_box_res is not None
+    btn_box, btn_label = send_box_res
+    assert btn_label == "send"
+    assert btn_box.bottom > 0.96
+
+
+
 
 
 

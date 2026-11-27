@@ -51,15 +51,19 @@ def clamp_avoiding_home_indicator(box: Box) -> Box:
     return box
 
 
-def left_biased_input_aim(input_box: Box) -> tuple[float, float]:
-    """Aim at the left-biased text-start area inside a WeChat input box, strictly above y > 0.95."""
-    safe_box = clamp_avoiding_home_indicator(input_box)
+def left_biased_input_aim(input_box: Box, *, avoid_home_indicator: bool = True) -> tuple[float, float]:
+    """Aim at the left-biased text-start area inside a WeChat input box."""
+    safe_box = clamp_avoiding_home_indicator(input_box) if avoid_home_indicator else input_box
     aim_x = safe_box.left + min(0.24 * safe_box.width, max(0.06, 0.16 * safe_box.width))
     aim_x = max(safe_box.left + 0.02, min(safe_box.right - 0.02, aim_x))
-    aim_y = min(safe_box.center[1], HOME_INDICATOR_MAX_SAFE_Y - 0.006)
-    aim_y = max(safe_box.top + 0.004, aim_y)
-    if is_in_home_indicator_zone(aim_x, aim_y):
-        aim_y = min(aim_y, HOME_INDICATOR_MAX_SAFE_Y - 0.01)
+    if avoid_home_indicator:
+        aim_y = min(safe_box.center[1], HOME_INDICATOR_MAX_SAFE_Y - 0.006)
+        aim_y = max(safe_box.top + 0.004, aim_y)
+        if is_in_home_indicator_zone(aim_x, aim_y):
+            aim_y = min(aim_y, HOME_INDICATOR_MAX_SAFE_Y - 0.01)
+    else:
+        aim_y = min(safe_box.center[1], min(0.992, safe_box.bottom - 0.004))
+        aim_y = max(safe_box.top + 0.004, aim_y)
     return (aim_x, aim_y)
 
 
